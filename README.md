@@ -36,7 +36,10 @@ Different configuration options for training and testing of models are specified
 
 2 diffusion model architectures are available in this codebase, adapted from the [SR3](https://arxiv.org/abs/2104.07636) and [DDPM](https://arxiv.org/abs/2006.11239) papers. The desired model architecture can be selected using the `which_model_G` variable in the config file. It is recommended to use the `sr3` architecture for standard diffusion models and the `ddpm` architecture for latent diffusion models.
 
-## Catchment data structure
+## Dataset
+Training and Test data for all catchments can be found [here](https://doi.org/10.25910/EZQ6-GG56).
+
+### Catchment data structure
 Catchment data should be stored in this folder structure:
 ```
 .
