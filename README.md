@@ -1,6 +1,6 @@
 # Flood-LDM: Generalizable Latent Diffusion Models for rapid and accurate zero-shot High-Resolution Flood Mapping
 
-## Accepted at WACV 2026: [arXiv](https://arxiv.org/abs/2511.14033)
+## [Accepted at WACV 2026](https://openaccess.thecvf.com/content/WACV2026/html/Neo_Flood-LDM_Generalizable_Latent_Diffusion_Models_for_rapid_and_accurate_zero-shot_WACV_2026_paper.html)
 
 ## Abstract
 Flood prediction is critical for emergency planning and response to mitigate human and economic losses. Traditional physics-based hydrodynamic models generate high-resolution flood maps using numerical methods requiring fine-grid discretization; which are computationally intensive and impractical for real-time large-scale applications. While recent studies have applied convolutional neural networks for flood map super-resolution with good accuracy and speed, they suffer from limited generalizability to unseen areas. In this paper, we propose a novel approach that leverages latent diffusion models to perform super-resolution on coarse-grid flood maps, with the objective of achieving the accuracy of fine-grid flood maps while significantly reducing inference time. Experimental results demonstrate that latent diffusion models substantially decrease the computational time required to produce high-fidelity flood maps without compromising on accuracy, enabling their use in real-time flood risk management. Moreover, diffusion models exhibit superior generalizability across different physical locations, with transfer learning further accelerating adaptation to new geographic regions. Our approach also incorporates physics-informed inputs, addressing the common limitation of black-box behavior in machine learning, thereby enhancing interpretability.
@@ -80,15 +80,13 @@ The super-resolution model outputs will be saved in the output directory if the 
 ## Citation
 If you use any of the code provided in this repository or the models provided, please cite the following paper:
 ```
-@misc{neo_2025_flood_ldm,
-    title={Flood-LDM: Generalizable Latent Diffusion Models for rapid and accurate zero-shot High-Resolution Flood Mapping}, 
-    author={Sun Han Neo and Sachith Seneviratne and Herath Mudiyanselage Viraj Vidura Herath and Abhishek Saha and Sanka Rasnayaka and Lucy Amanda Marshall},
-    year={2025},
-    month=nov,
-    eprint={2511.14033},
-    archivePrefix={arXiv},
-    primaryClass={cs.CV},
-    url={https://arxiv.org/abs/2511.14033}, 
+@InProceedings{Neo_2026_WACV,
+    author    = {Neo, Sun Han and Seneviratne, Sachith and Herath, Herath Mudiyanselage Viraj Vidura and Saha, Abhishek and Rasnayaka, Sanka and Marshall, Lucy Amanda},
+    title     = {Flood-LDM: Generalizable Latent Diffusion Models for rapid and accurate zero-shot High-Resolution Flood Mapping},
+    booktitle = {Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)},
+    month     = {March},
+    year      = {2026},
+    pages     = {8063-8072}
 }
 ```
 
