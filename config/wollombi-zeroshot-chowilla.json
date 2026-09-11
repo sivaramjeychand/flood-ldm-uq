@@ -39,11 +39,11 @@
             "data_len": -1
         },
         "test": {
-            "catchment": "Chowilla 1k (zero-shot from Wollombi)",
-            "dataroot": "../data/chowilla_1k",
+            "catchment": "Chowilla (zero-shot from Wollombi)",
+            "dataroot": "../data/chowilla",
             "batch_size": 40,
             "use_shuffle": false,
-            "data_len": -1,
+            "data_len": 1000, // full test period downloaded (49400 scenes), not the "_1k" subsample; capped here to preserve original quick-eval intent -- set to -1 for the full test set
             "epochs": 1
         }
     },

@@ -39,11 +39,11 @@
             "data_len": -1
         },
         "test": {
-            "catchment": "Burnett 1k (zero-shot from Wollombi)",
-            "dataroot": "../data/burnett_1k",
+            "catchment": "Burnett (zero-shot from Wollombi)",
+            "dataroot": "../data/burnett",
             "batch_size": 40,
             "use_shuffle": false,
-            "data_len": -1,
+            "data_len": 1000, // full test period downloaded (15360 scenes), not the "_1k" subsample; capped here to preserve original quick-eval intent -- set to -1 for the full test set
             "epochs": 1
         }
     },
