@@ -111,8 +111,12 @@ def main():
     norm_range = (meta['norm_min'], meta['norm_max'])
     max_depth = meta['max_depth']
 
-    hr_depth = Metrics.unnormalize(fixed_batch['HR'], max_depth, min_max=norm_range)
-    cg_depth = Metrics.unnormalize(fixed_batch['SR'], max_depth, min_max=norm_range)
+    # NOTE: diffusion.feed_data() moves tensors in fixed_batch onto the GPU in place
+    # (BaseModel.set_device mutates the dict it's given), so these must end up on CPU
+    # explicitly -- get_current_visuals() below always returns CPU tensors, and every
+    # ensemble comparison assumes hr_depth/cg_depth match that.
+    hr_depth = Metrics.unnormalize(fixed_batch['HR'], max_depth, min_max=norm_range).cpu()
+    cg_depth = Metrics.unnormalize(fixed_batch['SR'], max_depth, min_max=norm_range).cpu()
     cg_rmse = torch.sqrt(torch.mean((cg_depth - hr_depth) ** 2)).item()
 
     logger.info(f'Running {args.n_samples} stochastic reverse-diffusion passes over {n_scenes} fixed scenes...')
