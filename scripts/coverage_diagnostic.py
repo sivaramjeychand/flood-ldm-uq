@@ -42,20 +42,41 @@ def parse_args():
     parser.add_argument('--convergence_checkpoints', type=int, nargs='*',
                          default=[5, 10, 20, 30, 40, 50],
                          help='Ensemble sizes to also report coverage/RMSE at, to check convergence')
+    parser.add_argument('--flood_threshold_cm', type=float, default=5.0,
+                         help='Ground-truth depth threshold (cm) for the "flooded pixels only" stats -- '
+                              'flood rasters are mostly dry background, which trivially inflates whole-'
+                              'raster coverage/RMSE, so this reports calibration where it actually matters. '
+                              'Matches the 5cm threshold already used for POD/RFA/CSI elsewhere.')
     parser.add_argument('-debug', '-d', action='store_true')
     args = parser.parse_args()
     args.phase = 'test'  # required by core.logger.Logger.parse
     return args
 
 
-def coverage_and_stats(ensemble, hr_depth, ci):
-    """ensemble: (K, N, C, H, W) depth-space tensor. hr_depth: (N, C, H, W)."""
+def _masked_rms(x, mask):
+    """sqrt(mean(x**2)) over masked entries only; NaN if mask is empty."""
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.sqrt(torch.mean(x[mask] ** 2)).item()
+
+
+def _masked_mean(x, mask):
+    if mask.sum() == 0:
+        return float('nan')
+    return x[mask].float().mean().item()
+
+
+def coverage_and_stats(ensemble, hr_depth, ci, mask=None):
+    """ensemble: (K, N, C, H, W) depth-space tensor. hr_depth: (N, C, H, W).
+    mask: optional bool tensor matching hr_depth's shape; when given, every reported
+    statistic is computed over mask==True pixels only (e.g. flooded pixels), instead
+    of diluting them with the (usually large) trivially-correct dry-background area.
+    """
     alpha = 1 - ci
     lower = torch.quantile(ensemble, alpha / 2, dim=0)
     upper = torch.quantile(ensemble, 1 - alpha / 2, dim=0)
     inside = (hr_depth >= lower) & (hr_depth <= upper)
     ens_mean = ensemble.mean(dim=0)
-    ens_mean_rmse = torch.sqrt(torch.mean((ens_mean - hr_depth) ** 2)).item()
 
     # Spread-skill: RMS of per-pixel ensemble std ("spread") vs. ensemble-mean RMSE ("skill").
     # A well-calibrated ensemble has spread ~= skill (ratio ~1). Ratio << 1 means the ensemble
@@ -63,15 +84,23 @@ def coverage_and_stats(ensemble, hr_depth, ci):
     # the EGU abstract (deterministic conditioning suppressing sample diversity), as distinct
     # from under-coverage caused by a biased ensemble mean.
     pixel_std = ensemble.std(dim=0, unbiased=(ensemble.shape[0] > 1))
-    spread = torch.sqrt(torch.mean(pixel_std ** 2)).item()
-    mean_pi_width = (upper - lower).mean().item()
+    pi_width = upper - lower
+
+    if mask is None:
+        mask = torch.ones_like(hr_depth, dtype=torch.bool)
+
+    ens_mean_rmse = _masked_rms(ens_mean - hr_depth, mask) if mask.sum() > 0 else float('nan')
+    spread = _masked_rms(pixel_std, mask)
+    coverage = _masked_mean(inside, mask)
+    mean_pi_width = _masked_mean(pi_width, mask)
 
     return {
         'n_samples': int(ensemble.shape[0]),
-        'coverage': inside.float().mean().item(),
+        'n_pixels': int(mask.sum().item()),
+        'coverage': coverage,
         'ensemble_mean_rmse_cm': ens_mean_rmse,
         'spread_cm': spread,
-        'spread_skill_ratio': spread / ens_mean_rmse if ens_mean_rmse > 0 else float('nan'),
+        'spread_skill_ratio': spread / ens_mean_rmse if ens_mean_rmse and ens_mean_rmse > 0 else float('nan'),
         'mean_pi_width_cm': mean_pi_width,
     }
 
@@ -119,6 +148,13 @@ def main():
     cg_depth = Metrics.unnormalize(fixed_batch['SR'], max_depth, min_max=norm_range).cpu()
     cg_rmse = torch.sqrt(torch.mean((cg_depth - hr_depth) ** 2)).item()
 
+    # Flood rasters are mostly dry background (depth ~0), where the model is trivially
+    # correct/confident -- that dilutes whole-raster coverage/spread toward looking better
+    # calibrated than it is. This mask isolates the pixels that actually matter.
+    flood_mask = hr_depth > args.flood_threshold_cm
+    flood_frac = flood_mask.float().mean().item()
+    logger.info(f'Flooded pixels (HR depth > {args.flood_threshold_cm}cm): {flood_frac:.1%} of raster')
+
     logger.info(f'Running {args.n_samples} stochastic reverse-diffusion passes over {n_scenes} fixed scenes...')
     samples = []
     per_run_rmse = []
@@ -141,33 +177,52 @@ def main():
         'catchment': test_opt['catchment'],
         'n_scenes': n_scenes,
         'ci': args.ci,
+        'flood_threshold_cm': args.flood_threshold_cm,
+        'flooded_pixel_fraction': flood_frac,
         'coarse_grid_baseline_rmse_cm': cg_rmse,
         'per_run_rmse_cm': per_run_rmse,
     }
     checkpoints = sorted(set(cp for cp in args.convergence_checkpoints if cp <= args.n_samples) | {args.n_samples})
-    results['convergence'] = [coverage_and_stats(ensemble[:cp], hr_depth, args.ci) for cp in checkpoints]
+    results['convergence_all_pixels'] = [coverage_and_stats(ensemble[:cp], hr_depth, args.ci) for cp in checkpoints]
+    results['convergence_flooded_pixels'] = [
+        coverage_and_stats(ensemble[:cp], hr_depth, args.ci, mask=flood_mask) for cp in checkpoints
+    ]
+
+    def log_convergence(label, rows):
+        logger.info(f'-- {label} --')
+        for c in rows:
+            logger.info(f"  K={c['n_samples']:3d}: empirical {args.ci:.0%} PI coverage = {c['coverage']:.3f}, "
+                        f"ensemble-mean RMSE = {c['ensemble_mean_rmse_cm']:.3f} cm, "
+                        f"spread = {c['spread_cm']:.3f} cm, spread/skill = {c['spread_skill_ratio']:.3f}, "
+                        f"mean PI width = {c['mean_pi_width_cm']:.3f} cm")
 
     logger.info('=' * 60)
     logger.info(f'Coarse-grid baseline RMSE: {cg_rmse:.3f} cm')
     logger.info(f'Individual-run RMSE: mean={np.mean(per_run_rmse):.3f}, '
                 f'std={np.std(per_run_rmse):.3f} cm (EGU abstract found ~19-24cm)')
-    for c in results['convergence']:
-        logger.info(f"  K={c['n_samples']:3d}: empirical {args.ci:.0%} PI coverage = {c['coverage']:.3f}, "
-                    f"ensemble-mean RMSE = {c['ensemble_mean_rmse_cm']:.3f} cm, "
-                    f"spread = {c['spread_cm']:.3f} cm, spread/skill = {c['spread_skill_ratio']:.3f}, "
-                    f"mean PI width = {c['mean_pi_width_cm']:.3f} cm")
-    final = results['convergence'][-1]
-    logger.info(f"Nominal coverage target: {args.ci:.2f}. "
-                f"Under-coverage gap at K={final['n_samples']}: {args.ci - final['coverage']:.3f} "
+    logger.info(f'Flooded pixels (HR > {args.flood_threshold_cm}cm): {flood_frac:.1%} of raster')
+    log_convergence('All pixels (diluted by dry background)', results['convergence_all_pixels'])
+    log_convergence('Flooded pixels only (where calibration actually matters)',
+                     results['convergence_flooded_pixels'])
+
+    final_all = results['convergence_all_pixels'][-1]
+    final_flood = results['convergence_flooded_pixels'][-1]
+    logger.info(f"Nominal coverage target: {args.ci:.2f}.")
+    logger.info(f"  All-pixel under-coverage gap at K={final_all['n_samples']}: "
+                f"{args.ci - final_all['coverage']:.3f}")
+    logger.info(f"  Flooded-pixel under-coverage gap at K={final_flood['n_samples']}: "
+                f"{args.ci - final_flood['coverage']:.3f} "
                 f"(EGU abstract found ~{args.ci - 0.70:.2f} gap, i.e. ~70% actual coverage)")
-    if final['spread_skill_ratio'] < 0.9:
-        logger.info(f"DIVERSITY COLLAPSE INDICATED: spread/skill ratio = {final['spread_skill_ratio']:.3f} << 1 "
-                    f"-- ensemble spread ({final['spread_cm']:.3f} cm) under-represents actual error "
-                    f"({final['ensemble_mean_rmse_cm']:.3f} cm), consistent with the EGU abstract's "
-                    f"conditioning-driven diversity collapse, not a biased ensemble mean.")
+
+    verdict_ratio = final_flood['spread_skill_ratio']
+    if verdict_ratio < 0.9:
+        logger.info(f"DIVERSITY COLLAPSE INDICATED (flooded pixels): spread/skill ratio = {verdict_ratio:.3f} << 1 "
+                    f"-- ensemble spread ({final_flood['spread_cm']:.3f} cm) under-represents actual error "
+                    f"({final_flood['ensemble_mean_rmse_cm']:.3f} cm) where it matters, consistent with the "
+                    f"EGU abstract's conditioning-driven diversity collapse, not a biased ensemble mean.")
     else:
-        logger.info(f"No strong diversity collapse signal: spread/skill ratio = {final['spread_skill_ratio']:.3f} "
-                    f"(near 1 = well-calibrated spread).")
+        logger.info(f"No strong diversity collapse signal on flooded pixels: spread/skill ratio = "
+                    f"{verdict_ratio:.3f} (near 1 = well-calibrated spread).")
     logger.info('=' * 60)
 
     out_path = os.path.join(opt['path']['results'], 'coverage_diagnostic.json')
