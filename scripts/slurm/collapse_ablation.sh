@@ -13,9 +13,9 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=04:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=logs/slurm/%x-%j.out
-# #SBATCH --partition=<fill in>
+#SBATCH --partition=gpu
 
 set -euo pipefail
 
