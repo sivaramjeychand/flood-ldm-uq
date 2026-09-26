@@ -10,7 +10,7 @@
 # Env overrides: CONFIG (default config/wollombi-trnf.json), VENV (default ./venv)
 #
 #SBATCH --job-name=collapse
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100-80:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=03:00:00
