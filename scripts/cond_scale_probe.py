@@ -34,6 +34,9 @@ import os
 import sys
 import time
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [os.path.dirname(_HERE), _HERE]
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,9 +45,7 @@ import core.logger as Logger
 import core.metrics as Metrics
 import data as Data
 import model as Model
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from coverage_diagnostic import coverage_and_stats  # noqa: E402
+from coverage_diagnostic import coverage_and_stats
 
 
 def parse_args():
