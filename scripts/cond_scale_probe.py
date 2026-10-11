@@ -58,9 +58,10 @@ def parse_args():
     parser.add_argument('--scales', type=float, nargs='+',
                         default=[0.0, 0.25, 0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5],
                         help='Values of s to multiply W_c by. 1.0 reproduces the checkpoint.')
-    parser.add_argument('--target', choices=['cond', 'lr', 'dem'], default='cond',
+    parser.add_argument('--target', choices=['cond', 'lr', 'dem', 'noisy'], default='cond',
                         help='Which input slice of the stem conv to scale: '
-                             'cond = SR+DEM latents, lr = SR latent only, dem = DEM latent only')
+                             'cond = SR+DEM latents, lr = SR latent only, dem = DEM latent only, '
+                             'noisy = the x_t latent being denoised')
     parser.add_argument('--backward_start', type=int, default=None,
                         help='Override the test schedule backward_start (truncated reverse diffusion). '
                              'Set to n_timestep (1000) to start from pure noise.')
@@ -75,6 +76,8 @@ def parse_args():
 
 def cond_slice(target, dem):
     # ddpm path concatenates [x_noisy, lr, dem], 4 latent channels each (diffusion.py super_resolution)
+    if target == 'noisy':
+        return slice(0, 4)
     if target == 'lr':
         return slice(4, 8)
     if target == 'dem':

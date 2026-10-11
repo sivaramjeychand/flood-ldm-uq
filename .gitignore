@@ -132,3 +132,9 @@ dmypy.json
 train*.sh
 test*.sh
 analysis/
+
+# Cluster scratch
+venv-x86/
+requirements-old.txt
+pip-install.log
+logs/slurm/*.out
