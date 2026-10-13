@@ -125,27 +125,37 @@ class Runner:
                 self.net.backward_start = backward_start
                 return self.net.super_resolution(lr, dem).float(), None
 
-            # Same computation as ddpm_modules.GaussianDiffusion.super_resolution, but with a
-            # selectable encoder mode and the final latent returned before decoding.
-            z_s, z_mu, _ = self.net.vae.encode(lr)
-            lr_lat = z_s if cond_encode == 'sample' else z_mu
-            if self.net.dem:
-                d_s, d_mu, _ = self.net.vae_dem.encode(dem)
-                dem_lat = d_s if cond_encode == 'sample' else d_mu
-            B = lr_lat.shape[0]
-            if backward_start is None:
-                steps = self.T
-                x = torch.randn_like(lr_lat)
-            else:
-                steps = backward_start
-                t = torch.full((B,), backward_start, dtype=torch.long, device=lr_lat.device)
-                x = self.net.add_noise(lr_lat, torch.randn_like(lr_lat), t)
-            for t in reversed(range(steps)):
-                t_tensor = torch.full((B,), t, dtype=torch.long, device=lr_lat.device)
-                cond = [x, lr_lat, dem_lat] if self.net.dem else [x, lr_lat]
-                noise_pred = self.net.denoise_fn(torch.cat(cond, dim=1), t_tensor)
-                x = self.net.sample_prev_timestep(x, noise_pred, t)
+            x = self._reverse_chain(lr, dem, backward_start, cond_encode)
             return self.net.vae.decode(x).float(), x.float()
+
+    @torch.no_grad()
+    def sample_latent(self, lr, dem, backward_start, cond_encode):
+        """One reverse-diffusion draw, latent configs only. Returns the final latent, undecoded."""
+        with self._autocast():
+            return self._reverse_chain(lr, dem, backward_start, cond_encode).float()
+
+    def _reverse_chain(self, lr, dem, backward_start, cond_encode):
+        # Same computation as ddpm_modules.GaussianDiffusion.super_resolution, but with a
+        # selectable encoder mode and the final latent returned before decoding.
+        z_s, z_mu, _ = self.net.vae.encode(lr)
+        lr_lat = z_s if cond_encode == 'sample' else z_mu
+        if self.net.dem:
+            d_s, d_mu, _ = self.net.vae_dem.encode(dem)
+            dem_lat = d_s if cond_encode == 'sample' else d_mu
+        B = lr_lat.shape[0]
+        if backward_start is None:
+            steps = self.T
+            x = torch.randn_like(lr_lat)
+        else:
+            steps = backward_start
+            t = torch.full((B,), backward_start, dtype=torch.long, device=lr_lat.device)
+            x = self.net.add_noise(lr_lat, torch.randn_like(lr_lat), t)
+        for t in reversed(range(steps)):
+            t_tensor = torch.full((B,), t, dtype=torch.long, device=lr_lat.device)
+            cond = [x, lr_lat, dem_lat] if self.net.dem else [x, lr_lat]
+            noise_pred = self.net.denoise_fn(torch.cat(cond, dim=1), t_tensor)
+            x = self.net.sample_prev_timestep(x, noise_pred, t)
+        return x
 
     @torch.no_grad()
     def encode(self, img):
