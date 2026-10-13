@@ -362,7 +362,10 @@ def main():
         with torch.autocast(dev.type, dtype=amp_dtype, enabled=dev.type == 'cuda'):
             pred = runner.net.vae.decode(z)
         w = 1 + (args.flood_weight - 1) * (y > thr_norm).float()
-        return (w * (pred.float() - y) ** 2).mean()
+        # Clamp like to_depth does at eval. Unclamped, dry pixels decoded below norm_min dominate the
+        # loss (88% of pixels) although they're exact zeros after clamping, and the SSF shifts that
+        # fix them push flooded depths off (smoke2: floor 11.0 -> 14.5cm after 20 steps)
+        return (w * (pred.float().clamp(*norm_range) - y) ** 2).mean()
 
     # Frozen-decoder loss on the train pool, so member losses have a reference point
     with torch.no_grad():
@@ -376,6 +379,12 @@ def main():
     for m in range(args.n_members):
         gen = torch.Generator().manual_seed(args.seed * 1000 + m + 1)
         adapter.init_member(gen, args.init_std)
+        init_state = adapter.state()
+        init_floor = flooded_rmse_of_mu(init_state)
+        logger.info(f'  member {m}: VAE floor at init (before training) {init_floor:.3f} cm')
+        adapter.load(init_state)  # load() drops requires_grad, so restore it before building the optimiser
+        for p in adapter.parameters():
+            p.requires_grad_()
         adapter.enabled = True
         n = tr_lat.shape[0]
         pool = torch.arange(n) if args.no_bootstrap else torch.randint(n, (n,), generator=gen)
@@ -397,7 +406,8 @@ def main():
         torch.save(states[-1], os.path.join(out_dir, f'ssf_member{m}.pt'))
         floor = flooded_rmse_of_mu(states[-1])
         train_log.append({'member': m, 'final_loss': float(np.mean(losses[-250:])),
-                          'seconds': time.time() - t0, 'vae_floor_flooded_rmse_cm': floor})
+                          'seconds': time.time() - t0, 'vae_floor_flooded_rmse_cm': floor,
+                          'vae_floor_at_init_cm': init_floor})
         logger.info(f'member {m} done: VAE floor (flooded RMSE, eval scenes) {floor:.3f} cm '
                     f"vs base {results['vae_floor_flooded_rmse_cm']['base']:.3f} cm")
         results['ssf_training'] = train_log
