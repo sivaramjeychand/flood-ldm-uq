@@ -19,7 +19,7 @@ Methods (every ensemble uses --n_samples decodes per scene, so budgets match)
   ssf_single       SSF member 0 decodes every latent. Shows what fine-tuning alone does.
   ssf_ens          Deep ensemble. Each of --n_members SSF adapters (per-channel scale and
                    shift after every Conv2d / Linear in the decoder, ~29k params) is trained
-                   on its own: SSF's N(1, s) / N(0, s) random init, its own bootstrap of the
+                   on its own: random init N(1, s) / N(0, s) with small s, its own bootstrap of the
                    train pool, its own batch order. Latent i is decoded by member i mod M.
   cp_abs           Split conformal on the base ensemble mean, score |y - mean|. Fixed width.
   cp_norm          Score |y - mean| / (std + eps). Width follows the ensemble spread.
@@ -65,9 +65,11 @@ def parse_args():
     parser.add_argument('--n_members', type=int, default=5)
     parser.add_argument('--steps', type=int, default=2000, help='Optimiser steps per SSF member')
     parser.add_argument('--batch_size', type=int, default=4, help='SSF training batch (decoder runs at 512x512)')
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--init_std', type=float, default=0.02,
-                        help="SSF init: gamma ~ N(1, s), beta ~ N(0, s), as in the SSF paper")
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--init_std', type=float, default=1e-3,
+                        help="SSF init: gamma ~ N(1, s), beta ~ N(0, s). The SSF paper's 0.02 is far too "
+                             "large here: 1 normalised unit is 1600cm of depth, and the 2%% gain errors "
+                             "compound over 38 layers (smoke test: VAE floor 11cm -> 20-23cm)")
     parser.add_argument('--flood_weight', type=float, default=1.0,
                         help='Loss weight on flooded pixels (1 = plain MSE, the deep-ensemble default)')
     parser.add_argument('--train_target', choices=['ldm', 'mu'], default='ldm',
@@ -354,6 +356,22 @@ def main():
 
     # ---------------------------------------------------------- train SSF members
     amp_dtype = torch.bfloat16 if dev.type == 'cuda' and torch.cuda.is_bf16_supported() else torch.float16
+
+    def batch_loss(pick):
+        z, y = tr_lat[pick].to(dev), tr_hr[pick].to(dev)
+        with torch.autocast(dev.type, dtype=amp_dtype, enabled=dev.type == 'cuda'):
+            pred = runner.net.vae.decode(z)
+        w = 1 + (args.flood_weight - 1) * (y > thr_norm).float()
+        return (w * (pred.float() - y) ** 2).mean()
+
+    # Frozen-decoder loss on the train pool, so member losses have a reference point
+    with torch.no_grad():
+        adapter.enabled = False
+        n_ref = min(tr_lat.shape[0], 20 * args.batch_size)
+        base_loss = float(np.mean([batch_loss(torch.arange(i, min(i + args.batch_size, n_ref))).item()
+                                   for i in range(0, n_ref, args.batch_size)]))
+    results['base_train_loss'] = base_loss
+    logger.info(f'frozen-decoder train loss (first {n_ref} pool scenes): {base_loss:.3e}')
     states, train_log = [], []
     for m in range(args.n_members):
         gen = torch.Generator().manual_seed(args.seed * 1000 + m + 1)
@@ -365,12 +383,7 @@ def main():
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.steps)
         t0, losses = time.time(), []
         for step in range(args.steps):
-            pick = pool[torch.randint(len(pool), (args.batch_size,), generator=gen)]
-            z, y = tr_lat[pick].to(dev), tr_hr[pick].to(dev)
-            with torch.autocast(dev.type, dtype=amp_dtype, enabled=dev.type == 'cuda'):
-                pred = runner.net.vae.decode(z)
-            w = 1 + (args.flood_weight - 1) * (y > thr_norm).float()
-            loss = (w * (pred.float() - y) ** 2).mean()
+            loss = batch_loss(pool[torch.randint(len(pool), (args.batch_size,), generator=gen)])
             optim.zero_grad(set_to_none=True)
             loss.backward()
             optim.step()
