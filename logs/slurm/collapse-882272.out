@@ -1,0 +1,111 @@
+host=xgpj0 job=882272 tag=vae_floor config=config/wollombi-trnf.json
+NVIDIA A100 80GB PCIe, 81920 MiB
+26-09-26 12:16:55.501 - INFO:   name: wollombi-trnf
+  phase: test
+  distributed: False
+  amp: True
+  latent: True
+  dem: True
+  path:[
+    log: experiments/collapse/vae_floor/logs
+    tb_logger: experiments/collapse/vae_floor/tb_logger
+    results: experiments/collapse/vae_floor/results
+    checkpoint: experiments/collapse/vae_floor/checkpoint
+    resume_state: ../checkpoints/wollombi/I400000_E2920
+    vae_state: ../checkpoints/vae/vae.pth
+    vae_dem_state: ../checkpoints/vae/vae_dem.pth
+    experiments_root: experiments/collapse/vae_floor
+  ]
+  datasets:[
+    meta:[
+      max_depth: 3200
+      dem_max_value: 440
+      dem_min_value: -20
+      norm_min: -1
+      norm_max: 1
+      channels: 1
+      image_size: 512
+    ]
+    train:[
+      catchment: Wollombi Latent
+      dataroot: ../data/wollombi_latent
+      batch_size: 256
+      num_workers: 1
+      use_shuffle: True
+      data_len: -1
+    ]
+    test:[
+      catchment: Wollombi
+      dataroot: ../data/wollombi
+      batch_size: 40
+      use_shuffle: False
+      data_len: -1
+      epochs: 1
+    ]
+  ]
+  model:[
+    which_model_G: ddpm
+    finetune_norm: False
+    unet:[
+      in_channel: 12
+      out_channel: 4
+      inner_channel: 64
+      norm_groups: 16
+      channel_multiplier: [1, 2, 4, 8, 16]
+      attn_res: [16]
+      res_blocks: 1
+      dropout: 0
+    ]
+    beta_schedule:[
+      train:[
+        schedule: linear
+        n_timestep: 1000
+        linear_start: 1e-06
+        linear_end: 0.01
+      ]
+      test:[
+        schedule: linear
+        n_timestep: 1000
+        backward_start: 50
+        linear_start: 1e-06
+        linear_end: 0.01
+      ]
+    ]
+    diffusion:[
+      image_size: 64
+      loss_type: l2
+      conditional: True
+    ]
+  ]
+  train:[
+    n_iter: 400000
+    val_freq: 20000.0
+    save_checkpoint_freq: 20000.0
+    print_freq: 500
+    optimizer:[
+      type: adam
+      lr: 1e-06
+      lr_scheduler:[
+        schedule: linear_warmup
+        until: 10000
+      ]
+    ]
+  ]
+  test:[
+    save_results: False
+    thresholds: []
+  ]
+
+26-09-26 12:16:56.973 - INFO: Dataset [FloodDepthDatasetWithDEM - Wollombi (test)] is created.
+26-09-26 12:17:00.780 - INFO: Loading pretrained model for G [../checkpoints/wollombi/I400000_E2920] ...
+26-09-26 12:17:26.801 - INFO: Network G structure: GaussianDiffusion, with parameters: 323,425,614
+26-09-26 12:17:26.802 - INFO: Model [DDPM] is created.
+26-09-26 12:17:27.074 - INFO: 10 scenes, flooded fraction 16.5%, coarse-grid flooded RMSE 33.331 cm
+26-09-26 12:17:51.396 - INFO: ============================================================
+26-09-26 12:17:51.396 - INFO: VAE FLOOR: ground truth -> encode -> decode
+26-09-26 12:17:51.397 - INFO:   [all    ] RMSE 4.458 cm, MAE 1.321, bias -0.093, p95|err| 9.188
+26-09-26 12:17:51.397 - INFO:   [flooded] RMSE 10.743 cm, MAE 7.629, bias -0.955, p95|err| 22.531
+26-09-26 12:17:51.397 - INFO:   Oracle ensemble (20 sampled encodes of the TRUTH), flooded: coverage 0.044, spread/skill 0.035
+26-09-26 12:17:51.397 - INFO:   Encoder sigma (latent units) 0.0001 vs latent RMS 0.8526
+26-09-26 12:17:51.397 - INFO:   Compare the flooded RMSE above with the ensemble-mean flooded RMSE in the sweep below.
+26-09-26 12:17:51.423 - INFO: Saved experiments/collapse/vae_floor/results/collapse_ablation.json
