@@ -312,8 +312,9 @@ def main():
     results['ssf_params'] = adapter.n_params()
     logger.info(f'SSF on VAE decoder: {len(adapter.layers)} layers, {adapter.n_params():,} params per member')
 
-    def decode_stack(lat, member_of=None, states=None):
-        """Decode (K, N, 4, h, w) latents. member_of(k) picks the SSF state for draw k (None = base)."""
+    def decode_stack(lat, member_of=None, states=None, mask=None):
+        """Decode (K, N, 4, h, w) latents. member_of(k) picks the SSF state for draw k (None = base).
+        With a mask, keeps only the masked pixels, (K, P), so the full stack is never held in memory."""
         out = []
         for k in range(lat.shape[0]):
             if member_of is None:
@@ -321,7 +322,8 @@ def main():
             else:
                 adapter.load(states[member_of(k)])
                 adapter.enabled = True
-            out.append(to_depth(runner.decode(lat[k].to(dev))))
+            d = to_depth(runner.decode(lat[k].to(dev)))
+            out.append(d if mask is None else d[mask])
         adapter.enabled = False
         return torch.stack(out, 0)
 
@@ -389,28 +391,27 @@ def main():
         dump()
 
     # ---------------------------------------------------------- evaluate
+    del tr_lat, tr_hr
     ci, M = args.ci, args.n_members
     members = lambda k: k % M
-    flooded = lambda stack, mask: stack[:, mask]
 
     t0 = time.time()
+    # Only the base eval stack is held in full, for the cross-check against the earlier runs
+    # (same function they used). Every other stack keeps flooded pixels only, which keeps
+    # host memory at a few GB.
     ev_base = decode_stack(ev_lat)
-    ev_ssf = decode_stack(ev_lat, members, states)
-    ev_ssf1 = decode_stack(ev_lat, lambda k: 0, states)
-    ca_base = decode_stack(ca_lat)
-    ca_ssf = decode_stack(ca_lat, members, states)
+    results['base_coverage_and_stats_flooded'] = coverage_and_stats(ev_base, ev_hr, ci, mask=ev_mask)
+    E = {'base': ev_base[:, ev_mask]}
+    del ev_base
+    E['ssf_single'] = decode_stack(ev_lat, lambda k: 0, states, mask=ev_mask)
+    E['ssf_ens'] = decode_stack(ev_lat, members, states, mask=ev_mask)
+    C = {'base': decode_stack(ca_lat, mask=ca_mask), 'ssf_ens': decode_stack(ca_lat, members, states, mask=ca_mask)}
     logger.info(f'decoded all stacks ({time.time() - t0:.0f}s)')
-
     y_ev, y_ca = ev_hr[ev_mask], ca_hr[ca_mask]
-    E = {'base': flooded(ev_base, ev_mask), 'ssf_single': flooded(ev_ssf1, ev_mask),
-         'ssf_ens': flooded(ev_ssf, ev_mask)}
-    C = {'base': flooded(ca_base, ca_mask), 'ssf_ens': flooded(ca_ssf, ca_mask)}
 
     rows = {}
     for name, ens in E.items():
         rows[name] = ensemble_metrics(ens, y_ev, ci)
-    # Same function as the earlier runs, as a cross-check that `base` reproduces them
-    results['base_coverage_and_stats_flooded'] = coverage_and_stats(ev_base, ev_hr, ci, mask=ev_mask)
     for kind in ('abs', 'norm', 'cqr'):
         rows[f'cp_{kind}'] = conformal(C['base'], y_ca, E['base'], y_ev, ci, kind, args.cp_eps_cm)
     rows['ssf_ens+cp_norm'] = conformal(C['ssf_ens'], y_ca, E['ssf_ens'], y_ev, ci, 'norm', args.cp_eps_cm)
