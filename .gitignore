@@ -138,3 +138,4 @@ venv-x86/
 requirements-old.txt
 pip-install.log
 logs/slurm/*.out
+*.out
