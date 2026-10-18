@@ -10,9 +10,20 @@ conv output (downs[0], 64 channels), trained with a CRPS loss through the full r
   deterministic         gamma = mu, beta learned. 128 params. Spread comes from reverse
                         diffusion only (the plan's literal Variant 2, a single adapter).
 
-Loss: fair (unbiased) ensemble CRPS of M draws per scene on the decoded depth, in cm, clamped
-to [norm_min, norm_max] first as eval does. Mean over flooded pixels plus --dry_weight times
-the mean over dry pixels. Gradients run through every reverse step (per-step gradient
+Loss (--loss), per pixel on the decoded depth in cm, clamped to [norm_min, norm_max] first as
+eval does; mean over flooded pixels plus --dry_weight times the mean over dry pixels:
+  crps (default)  fair (unbiased) ensemble CRPS of the M draws per scene. Its optimum sits near
+                  the untrained sigma=0.05 (stem_gain_probe), so it does not push coverage up.
+  is              interval score of the Gaussian --ci interval mean +- z * std (unbiased std of
+                  the M draws). The empirical quantiles of M=4 draws are too coarse to train on;
+                  under the Gaussian proxy the optimum is coverage = --ci.
+--train sigma freezes mu=1, beta=0 and trains only log sigma (64 params): mu and beta are shared
+by every member, so they move the ensemble mean and cannot widen it.
+--grad_probe N: no training. At init, N fixed train batches, each rolled out twice with the
+same eps, encoder noise and chain noise (bf16 and fp16 autocast). Logs the mean and spread of
+the log-sigma gradient over batches for both losses, and how well the bf16 and fp16 gradients
+agree. Separates "no gradient signal" from "no capacity" before spending a training run.
+Gradients run through every reverse step (per-step gradient
 checkpointing on the U-Net) and through the frozen VAE decoder. The U-Net, both VAEs and
 the encoder noise get no gradients; only the adapter trains.
 
@@ -29,6 +40,11 @@ Usage (from the repo root):
     # plumbing check:
     python scripts/train_stem_adapter.py -c config/wollombi-trnf.json -output_dir experiments/stem_adapter/smoke \
         --steps 10 --val_every 5 --n_val 2 --val_draws 2 --n_eval 4 --n_calib 4 --n_samples 6 --eval_init
+    # gradient diagnostic (~4 rollouts + backward per batch), then sigma-only coverage training:
+    python scripts/train_stem_adapter.py -c config/wollombi-trnf.json -output_dir experiments/stem_adapter/probe \
+        --grad_probe 20
+    python scripts/train_stem_adapter.py -c config/wollombi-trnf.json -output_dir experiments/stem_adapter/v2 \
+        --train sigma --loss is --eval_init
 """
 import argparse
 import json
@@ -62,7 +78,13 @@ def parse_args():
     parser.add_argument('--draws', type=int, default=4, help='Ensemble members per scene per step (>= 2 for CRPS)')
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--grad_clip', type=float, default=1.0)
-    parser.add_argument('--dry_weight', type=float, default=0.1, help='Weight on the dry-pixel CRPS term')
+    parser.add_argument('--dry_weight', type=float, default=0.1, help='Weight on the dry-pixel loss term')
+    parser.add_argument('--loss', choices=['crps', 'is'], default='crps',
+                        help='crps: fair ensemble CRPS; is: Gaussian-proxy interval score at --ci')
+    parser.add_argument('--train', choices=['all', 'sigma'], default='all',
+                        help='sigma: freeze mu=1, beta=0 and train only log sigma (stochastic mode)')
+    parser.add_argument('--grad_probe', type=int, default=0,
+                        help='N > 0: log-sigma gradient diagnostic over N fixed batches at init, then exit')
     parser.add_argument('--n_train', type=int, default=2000, help='Train-split scenes in the pool')
     parser.add_argument('--log_every', type=int, default=25)
     # validation during training (held-out test scenes, disjoint from eval and calib)
@@ -84,6 +106,8 @@ def parse_args():
     args.phase = 'test'
     if args.draws < 2:
         parser.error('--draws must be >= 2: the CRPS spread term needs at least two members')
+    if (args.train == 'sigma' or args.grad_probe) and args.mode != 'stochastic':
+        parser.error('--train sigma and --grad_probe need --mode stochastic')
     return args
 
 
@@ -134,6 +158,16 @@ def fair_crps(ens, y):
     w = (2 * torch.arange(1, M + 1, device=ens.device, dtype=ens.dtype) - M - 1).view(-1, *[1] * y.dim())
     pair = (w * ens.sort(0).values).sum(0) / (M * (M - 1))
     return term1 - pair
+
+
+def gauss_is(ens, y, ci):
+    """Per-pixel interval score of the Gaussian central `ci` interval mean +- z * std from (M, ...)
+    members (unbiased std) vs (...) truth. Minimised when the interval covers with probability ci."""
+    alpha = 1 - ci
+    z = torch.distributions.Normal(0., 1.).icdf(torch.tensor(1 - alpha / 2)).item()
+    m, s = ens.mean(0), ens.std(0, unbiased=True)
+    lo, hi = m - z * s, m + z * s
+    return (hi - lo) + (2 / alpha) * ((lo - y).clamp(min=0) + (y - hi).clamp(min=0))
 
 
 # ------------------------------------------------------------------ main
@@ -338,57 +372,127 @@ def main():
     if diff > 1e-3:
         raise SystemExit('identity adapter changes the U-Net output; hook is wrong')
 
+    # ---------------------------------------------------------- per-batch loss (with grad)
+    M = args.draws
+
+    def batch_losses(batch, eps, dtype):
+        """B scenes x M members, each with its own encoder noise, chain noise and gain.
+        Returns {loss name: (flooded mean, flooded + dry_weight * dry mean)} for crps and is."""
+        lr, dem = batch_cond(batch)
+        B = lr.shape[0]
+        lr_r = lr.repeat_interleave(M, 0)
+        dem_r = dem.repeat_interleave(M, 0) if dem is not None else None
+        lr_lat, dem_lat = encode_cond(lr_r, dem_r)
+        with torch.autocast('cuda', dtype=dtype):
+            x = rollout(lr_lat, dem_lat, adapter.gains(eps), adapter.beta, grad=True)
+            pred = to_cm(net.vae.decode(x)).squeeze(1)  # (B*M, H, W)
+        y = to_cm(batch['HR'].to(dev)).squeeze(1)       # (B, H, W)
+        ens = pred.view(B, M, *pred.shape[1:]).transpose(0, 1)
+        fl = y > args.flood_threshold_cm
+        out = {}
+        for name, px in (('crps', fair_crps(ens, y)), ('is', gauss_is(ens, y, args.ci))):
+            loss_fl = px[fl].mean() if fl.any() else px.new_full((), float('nan'))  # all-dry batch
+            out[name] = (loss_fl, (loss_fl if fl.any() else 0) + args.dry_weight * px[~fl].mean())
+        return out
+
+    # ---------------------------------------------------------- gradient diagnostic (no training)
+    if args.grad_probe:
+        probe_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(train_set, train_idx), batch_size=args.batch_scenes, shuffle=True,
+            drop_last=True, num_workers=2, pin_memory=True, generator=torch.Generator().manual_seed(args.seed + 50))
+        probe_eps_gen = torch.Generator().manual_seed(args.seed + 51)
+        dtypes = {'bf16': torch.bfloat16, 'fp16': torch.float16}
+        G = {(d, l): [] for d in dtypes for l in ('crps', 'is')}
+        t0 = time.time()
+        for i, batch in enumerate(probe_loader):
+            if i >= args.grad_probe:
+                break
+            eps = torch.randn(args.batch_scenes * M, adapter.mu.numel(), generator=probe_eps_gen).to(dev)
+            for d, dt in dtypes.items():
+                for l in ('crps', 'is'):
+                    torch.manual_seed(args.seed + 60 + i)  # same encoder and chain noise in all four passes
+                    g, = torch.autograd.grad(batch_losses(batch, eps, dt)[l][1], adapter.log_sigma)
+                    G[(d, l)].append(g.float().cpu())
+            logger.info(f'grad probe batch {i + 1}/{args.grad_probe} ({time.time() - t0:.0f}s)')
+        probe = {}
+        for (d, l), gs in G.items():
+            g = torch.stack(gs)                       # (N, C)
+            ok = torch.isfinite(g).all(1)
+            g, n = g[ok], int(ok.sum())
+            t_ch = g.mean(0) / (g.std(0) / math.sqrt(n))
+            shared = g.sum(1)                         # gradient along a common shift of all log sigma
+            probe[f'{d}/{l}'] = {
+                'n_finite': n, 'n_batches': len(gs),
+                'shared_mean': shared.mean().item(), 'shared_std': shared.std().item(),
+                'shared_t': (shared.mean() / (shared.std() / math.sqrt(n))).item(),
+                'channel_abs_t_median': t_ch.abs().median().item(),
+                'channel_frac_abs_t_gt2': (t_ch.abs() > 2).float().mean().item()}
+        for l in ('crps', 'is'):
+            a, b = torch.stack(G[('bf16', l)]), torch.stack(G[('fp16', l)])
+            ok = torch.isfinite(a).all(1) & torch.isfinite(b).all(1)
+            a, b = a[ok], b[ok]
+            probe[f'agree/{l}'] = {
+                'cosine_mean': torch.nn.functional.cosine_similarity(a, b, dim=1).mean().item(),
+                'rel_diff_median': ((a - b).norm(dim=1) / a.norm(dim=1)).median().item()}
+        results['grad_probe'] = probe
+        dump()
+        logger.info('log-sigma gradient over batches. shared = sum over channels (a common shift of log sigma); '
+                    'shared_mean > 0 means the loss wants a smaller sigma. |t| < 2 is noise.')
+        logger.info(f"{'':>10} {'finite':>7} {'shared mean':>12} {'std':>10} {'t':>7} {'ch med|t|':>10} {'ch |t|>2':>9}")
+        for k, r in probe.items():
+            if k.startswith('agree'):
+                continue
+            logger.info(f"{k:>10} {r['n_finite']:>3}/{r['n_batches']:<3} {r['shared_mean']:12.3e} {r['shared_std']:10.3e} "
+                        f"{r['shared_t']:7.2f} {r['channel_abs_t_median']:10.2f} {r['channel_frac_abs_t_gt2']:9.2f}")
+        for l in ('crps', 'is'):
+            r = probe[f'agree/{l}']
+            logger.info(f"bf16 vs fp16 ({l}): mean cosine {r['cosine_mean']:.3f}, "
+                        f"median |g_bf16 - g_fp16| / |g_bf16| {r['rel_diff_median']:.3f}")
+        logger.info(f'Saved {out_path}')
+        return
+
     if args.eval_init:
         evaluate('init')
     v = validate()
     results['val_log'].append({'step': 0, **v, 'adapter': adapter.summary()})
-    logger.info(f"val step 0: flooded CRPS {v['crps_cm']:.3f} cov {v['coverage']:.3f} "
+    logger.info(f"val step 0: flooded CRPS {v['crps_cm']:.3f} IS {v['interval_score_cm']:.2f} cov {v['coverage']:.3f} "
                 f"ss {v['spread_skill_ratio']:.3f} RMSE {v['ensemble_mean_rmse_cm']:.3f}")
     dump()
 
     # ---------------------------------------------------------- train
-    optim = torch.optim.Adam(adapter.parameters(), lr=args.lr)
-    M, t0, losses, step = args.draws, time.time(), [], 0
+    if args.train == 'sigma':
+        adapter.mu.requires_grad_(False)
+        adapter.beta.requires_grad_(False)
+    optim = torch.optim.Adam([p for p in adapter.parameters() if p.requires_grad], lr=args.lr)
+    t0, losses, step = time.time(), [], 0
     train_eps_gen = torch.Generator().manual_seed(args.seed + 40)
     torch.manual_seed(args.seed + 41)
     while step < args.steps:
         for batch in train_loader:
             if step >= args.steps:
                 break
-            lr, dem = batch_cond(batch)
-            B = lr.shape[0]
-            # B scenes x M members; each member has its own encoder noise, chain noise and gain
-            lr_r = lr.repeat_interleave(M, 0)
-            dem_r = dem.repeat_interleave(M, 0) if dem is not None else None
-            lr_lat, dem_lat = encode_cond(lr_r, dem_r)
-            eps = torch.randn(B * M, adapter.mu.numel(), generator=train_eps_gen).to(dev)
-            with torch.autocast('cuda', dtype=torch.bfloat16):
-                x = rollout(lr_lat, dem_lat, adapter.gains(eps), adapter.beta, grad=True)
-                pred = to_cm(net.vae.decode(x)).squeeze(1)  # (B*M, H, W)
-            y = to_cm(batch['HR'].to(dev)).squeeze(1)       # (B, H, W)
-            crps = fair_crps(pred.view(B, M, *pred.shape[1:]).transpose(0, 1), y)
-            fl = y > args.flood_threshold_cm
-            loss_fl = crps[fl].mean() if fl.any() else crps.new_zeros(())
-            loss = loss_fl + args.dry_weight * crps[~fl].mean()
+            eps = torch.randn(args.batch_scenes * M, adapter.mu.numel(), generator=train_eps_gen).to(dev)
+            out = batch_losses(batch, eps, torch.bfloat16)
             optim.zero_grad(set_to_none=True)
-            loss.backward()
+            out[args.loss][1].backward()
             gnorm = torch.nn.utils.clip_grad_norm_(adapter.parameters(), args.grad_clip).item()
             optim.step()
             step += 1
-            losses.append(loss_fl.item() if fl.any() else float('nan'))  # all-dry batch: no flooded CRPS
+            losses.append([out['crps'][0].item(), out['is'][0].item()])  # nan on an all-dry batch
             if step == 1 or step % args.log_every == 0:
                 s = adapter.summary()
-                recent = float(np.nanmean(losses[-args.log_every:])) if not np.all(np.isnan(losses[-args.log_every:])) \
-                    else float('nan')
-                results['train_log'].append({'step': step, 'flooded_crps_cm': recent, 'grad_norm': gnorm, **s})
-                logger.info(f'step {step}/{args.steps} flooded CRPS {recent:.3f}cm '
+                recent = np.asarray(losses[-args.log_every:])
+                recent = [float(np.nanmean(c)) if not np.all(np.isnan(c)) else float('nan') for c in recent.T]
+                results['train_log'].append({'step': step, 'flooded_crps_cm': recent[0], 'flooded_is_cm': recent[1],
+                                             'grad_norm': gnorm, **s})
+                logger.info(f'step {step}/{args.steps} flooded CRPS {recent[0]:.3f}cm IS {recent[1]:.2f}cm '
                             f'|g| {gnorm:.2e} sigma {s["sigma_mean"]:.4f} [{s["sigma_min"]:.4f}, {s["sigma_max"]:.4f}] '
                             f'mu {s["mu_mean"]:.4f}+-{s["mu_std"]:.4f} |beta| {s["beta_abs_mean"]:.2e} '
                             f'({time.time() - t0:.0f}s)')
             if step % args.val_every == 0 or step == args.steps:
                 v = validate()
                 results['val_log'].append({'step': step, **v, 'adapter': adapter.summary()})
-                logger.info(f"val step {step}: flooded CRPS {v['crps_cm']:.3f} cov {v['coverage']:.3f} "
+                logger.info(f"val step {step}: flooded CRPS {v['crps_cm']:.3f} IS {v['interval_score_cm']:.2f} cov {v['coverage']:.3f} "
                             f"ss {v['spread_skill_ratio']:.3f} RMSE {v['ensemble_mean_rmse_cm']:.3f}")
                 save()
                 dump()
