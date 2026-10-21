@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=condscale
 #SBATCH --partition=gpu
+# xgpj0: torch CUDA library preload fails there (job 939926)
+#SBATCH --exclude=xgpj0
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
