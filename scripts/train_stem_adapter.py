@@ -655,8 +655,9 @@ def main():
     save()
     logger.info(f'training done ({time.time() - t0:.0f}s); saved {ckpt_path}')
     evaluate('trained')
-    logger.info('targets (stem_gain_probe, untrained): CRPS 6.604 (sigma=0.05), raw IS 57.96 / cov 0.858 '
-                '(sigma=0.08); base RMSE 11.911; post-hoc reference cp_cqr IS 51.45')
+    logger.info('targets (stem_gain_probe v3-uniform-dense, untrained uniform sigma): CRPS 6.592 (sigma=0.055), '
+                'raw IS 57.78 / cov 0.843 (sigma=0.075), cov 0.817 at ss=1 (sigma~0.068); base RMSE 11.911; '
+                'post-hoc reference cp_cqr IS 51.45')
     dump()
     logger.info(f'Saved {out_path}')
 
