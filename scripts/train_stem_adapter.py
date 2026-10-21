@@ -9,6 +9,18 @@ conv output (downs[0], 64 channels), trained with a CRPS loss through the full r
                         probe at that sigma (same eps draws at eval).
   deterministic         gamma = mu, beta learned. 128 params. Spread comes from reverse
                         diffusion only (the plan's literal Variant 2, a single adapter).
+  spatial               gamma(x, y) = 1 + sigma(x, y) * eps, eps ~ N(0, I) per member and channel as
+                        in stochastic mode, with log sigma(x, y) = log sigma_c + conv1x1(cond)(x, y):
+                        a per-pixel spread read from the conditioning latents (LR + DEM, the stem
+                        input after the noisy-latent channels), fixed over the reverse chain.
+                        --map_channels 1 (64 + 9 params) or 64 (64 + 576). Zero-init conv, so the
+                        init is the stochastic adapter at --init_sigma. mu=1, beta=0 stay frozen.
+                        Mean sigma is not a fair match to a uniform run (the gain's effect scales
+                        with the activation it multiplies); compare with --ref_sweep instead.
+
+--ref_sweep: raw coverage, IS and CRPS against a uniform-sigma stem_gain_probe sweep interpolated
+at the same spread/skill. Above the curve = the adapter places spread better than uniform sigma.
+The init eval of a stochastic/spatial run is uniform sigma, so it should land on the curve.
 
 Loss (--loss), per pixel on the decoded depth in cm, clamped to [norm_min, norm_max] first as
 eval does; mean over flooded pixels plus --dry_weight times the mean over dry pixels:
@@ -17,6 +29,9 @@ eval does; mean over flooded pixels plus --dry_weight times the mean over dry pi
   is              interval score of the Gaussian --ci interval mean +- z * std (unbiased std of
                   the M draws). The empirical quantiles of M=4 draws are too coarse to train on;
                   under the Gaussian proxy the optimum is coverage = --ci.
+--cov_weight w adds w * relu(ci - soft coverage) to either loss, the soft coverage being the
+flooded-pixel mean of sigmoid((y - lo) / T) * sigmoid((hi - y) / T) on the Gaussian interval
+(T = --cov_temp cm). IS already charges misses at 2/alpha, so keep w small (a few cm).
 --train sigma freezes mu=1, beta=0 and trains only log sigma (64 params): mu and beta are shared
 by every member, so they move the ensemble mean and cannot widen it.
 --grad_probe N: no training. At init, N fixed train batches, each rolled out twice with the
@@ -45,6 +60,9 @@ Usage (from the repo root):
         --grad_probe 20
     python scripts/train_stem_adapter.py -c config/wollombi-trnf.json -output_dir experiments/stem_adapter/v2 \
         --train sigma --loss is --eval_init
+    # spatial sigma map, IS, 8 members of 1 scene per step, lower lr over a longer schedule:
+    python scripts/train_stem_adapter.py -c config/wollombi-trnf.json -output_dir experiments/stem_adapter/v3-spatial-is \
+        --mode spatial --map_channels 1 --loss is --batch_scenes 1 --draws 8 --lr 1e-3 --steps 2000 --eval_init
 """
 import argparse
 import json
@@ -69,9 +87,20 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', type=str, required=True)
     parser.add_argument('-output_dir', type=str, default='experiments/stem_adapter')
-    parser.add_argument('--mode', choices=['stochastic', 'deterministic'], default='stochastic')
+    parser.add_argument('--mode', choices=['stochastic', 'deterministic', 'spatial'], default='stochastic')
     parser.add_argument('--init_sigma', type=float, default=0.05,
-                        help='Initial gain std (stochastic mode). 0.05 = best untrained CRPS in stem_gain_probe')
+                        help='Initial gain std (stochastic/spatial mode). 0.05 = best untrained CRPS in stem_gain_probe')
+    parser.add_argument('--map_channels', type=int, default=1,
+                        help='Spatial mode: sigma maps output by the 1x1 conv, 1 (shared by all stem channels) '
+                             'or the stem width (one per channel)')
+    parser.add_argument('--max_sigma', type=float, default=0.5, help='Spatial mode: upper clamp on sigma(x, y)')
+    parser.add_argument('--ref_sweep', type=str, nargs='+', default=[],
+                        help='stem_gain_probe.json files of a uniform-sigma sweep (same eval protocol). Eval reports '
+                             'raw coverage / IS / CRPS against that curve interpolated at the same spread/skill')
+    parser.add_argument('--cov_weight', type=float, default=0.,
+                        help='Weight on the soft-coverage penalty relu(ci - soft coverage) added to the loss; 0 = off')
+    parser.add_argument('--cov_temp', type=float, default=1.0,
+                        help='Soft-coverage sigmoid temperature, cm')
     # training
     parser.add_argument('--steps', type=int, default=1000)
     parser.add_argument('--batch_scenes', type=int, default=2, help='Scenes per step')
@@ -106,48 +135,101 @@ def parse_args():
     args.phase = 'test'
     if args.draws < 2:
         parser.error('--draws must be >= 2: the CRPS spread term needs at least two members')
-    if (args.train == 'sigma' or args.grad_probe) and args.mode != 'stochastic':
-        parser.error('--train sigma and --grad_probe need --mode stochastic')
+    if (args.train == 'sigma' or args.grad_probe) and args.mode == 'deterministic':
+        parser.error('--train sigma and --grad_probe need --mode stochastic or spatial')
     return args
 
 
 # ------------------------------------------------------------------ adapter
 
 class StemAdapter(nn.Module):
-    """out * gamma + beta on the stem conv output, through a forward hook. gamma/beta for the
-    current forward pass are set per batch element with set_draw(); None = identity."""
+    """out * gamma + beta on the stem conv output, through a forward hook. The (draw, beta) for
+    the current forward pass is set in self.current; None = identity. draw is (N, C): the gains
+    in stochastic/deterministic mode, the standard-normal eps in spatial mode (the hook builds
+    the gain map from the stem's input)."""
 
-    def __init__(self, stem, mode, init_sigma):
+    def __init__(self, stem, mode, init_sigma, x_channels=4, map_channels=1, max_sigma=0.5):
         super().__init__()
         C = stem.out_channels
         self.mode = mode
+        self.x_channels = x_channels
+        self.max_log_sigma = math.log(max_sigma)
         self.mu = nn.Parameter(torch.ones(C))
         self.beta = nn.Parameter(torch.zeros(C))
-        if mode == 'stochastic':
+        if mode in ('stochastic', 'spatial'):
             self.log_sigma = nn.Parameter(torch.full((C,), math.log(init_sigma)))
+        if mode == 'spatial':
+            # zero init: sigma(x, y) = exp(log_sigma) everywhere, i.e. the stochastic adapter at init
+            self.sigma_conv = nn.Conv2d(stem.in_channels - x_channels, map_channels, 1)
+            nn.init.zeros_(self.sigma_conv.weight)
+            nn.init.zeros_(self.sigma_conv.bias)
+            self.reset_stats()
         self.current = None
         self.handle = stem.register_forward_hook(self._hook)
+
+    def sigma_map(self, cond):
+        """(N, C, h, w) per-pixel gain std from the (N, n_cond, h, w) conditioning latents."""
+        log_s = self.log_sigma[None, :, None, None] + self.sigma_conv(cond.float())
+        return log_s.clamp(max=self.max_log_sigma).exp()
 
     def _hook(self, module, inputs, out):
         if self.current is None:
             return None
-        g, b = self.current
-        return out * g.to(out.dtype)[:, :, None, None] + b.to(out.dtype)[None, :, None, None]
+        d, b = self.current
+        if self.mode == 'spatial':
+            s = self.sigma_map(inputs[0][:, self.x_channels:])
+            self._record(s.detach())
+            g = self.mu[None, :, None, None] + s * d[:, :, None, None]
+        else:
+            g = d[:, :, None, None]
+        return out * g.to(out.dtype) + b.to(out.dtype)[None, :, None, None]
+
+    def reset_stats(self):
+        self._stats = {'sum': 0., 'n': 0, 'min': float('inf'), 'max': 0., 'pix_std_sum': 0., 'n_maps': 0}
+
+    def _record(self, s):
+        st = self._stats
+        st['sum'] += s.sum().item()
+        st['n'] += s.numel()
+        st['min'] = min(st['min'], s.min().item())
+        st['max'] = max(st['max'], s.max().item())
+        # spatial variation: std over pixels of the channel-mean sigma, per batch element
+        st['pix_std_sum'] += s.mean(1).flatten(1).std(1).sum().item()
+        st['n_maps'] += s.shape[0]
 
     def sigma(self):
-        return self.log_sigma.exp() if self.mode == 'stochastic' else torch.zeros_like(self.mu)
+        return self.log_sigma.exp() if self.mode != 'deterministic' else torch.zeros_like(self.mu)
 
     def gains(self, eps):
-        """(N, C) gains for N draws from (N, C) standard-normal eps (ignored if deterministic)."""
+        """(N, C) per-draw input for the hook from (N, C) standard-normal eps: gains in stochastic
+        and deterministic (eps ignored) mode, eps itself in spatial mode."""
+        if self.mode == 'spatial':
+            return eps
         if self.mode == 'stochastic':
             return self.mu + self.sigma() * eps
         return self.mu.expand(eps.shape[0], -1)
 
+    def identity(self, n, device):
+        """Per-draw input that makes the hook the identity while mu=1, beta=0."""
+        return torch.zeros(n, self.mu.numel(), device=device) if self.mode == 'spatial' \
+            else torch.ones(n, self.mu.numel(), device=device)
+
     def summary(self):
-        s = self.sigma().detach()
-        return {'mu_mean': self.mu.mean().item(), 'mu_std': self.mu.std().item(),
-                'sigma_mean': s.mean().item(), 'sigma_min': s.min().item(), 'sigma_max': s.max().item(),
-                'beta_abs_mean': self.beta.abs().mean().item()}
+        """Spatial mode: sigma over every (pixel, channel) the hook saw since reset_stats(), so it
+        is the mean sigma to match against a uniform-sigma run."""
+        r = {'mu_mean': self.mu.mean().item(), 'mu_std': self.mu.std().item(),
+             'beta_abs_mean': self.beta.abs().mean().item()}
+        if self.mode == 'spatial':
+            st = self._stats
+            n = max(st['n'], 1)
+            r.update(sigma_mean=st['sum'] / n, sigma_min=st['min'] if st['n'] else float('nan'),
+                     sigma_max=st['max'], sigma_pix_std=st['pix_std_sum'] / max(st['n_maps'], 1),
+                     sigma_base_mean=self.sigma().mean().item(),
+                     conv_w_abs_mean=self.sigma_conv.weight.abs().mean().item())
+        else:
+            s = self.sigma().detach()
+            r.update(sigma_mean=s.mean().item(), sigma_min=s.min().item(), sigma_max=s.max().item())
+        return r
 
 
 def fair_crps(ens, y):
@@ -168,6 +250,41 @@ def gauss_is(ens, y, ci):
     m, s = ens.mean(0), ens.std(0, unbiased=True)
     lo, hi = m - z * s, m + z * s
     return (hi - lo) + (2 / alpha) * ((lo - y).clamp(min=0) + (y - hi).clamp(min=0))
+
+
+def gauss_soft_cov(ens, y, ci, temp):
+    """Per-pixel soft indicator that y lies inside the Gaussian central `ci` interval of gauss_is:
+    sigmoid((y - lo) / temp) * sigmoid((hi - y) / temp)."""
+    alpha = 1 - ci
+    z = torch.distributions.Normal(0., 1.).icdf(torch.tensor(1 - alpha / 2)).item()
+    m, s = ens.mean(0), ens.std(0, unbiased=True)
+    return torch.sigmoid((y - m + z * s) / temp) * torch.sigmoid((m + z * s - y) / temp)
+
+
+def load_ref_curve(paths):
+    """Raw-ensemble rows of uniform-sigma stem_gain_probe sweeps, merged and sorted by spread/skill."""
+    pts = {}
+    for p in paths:
+        with open(p) as f:
+            for s, r in json.load(f)['sweep'].items():
+                pts[float(s)] = r['raw']
+    return sorted(((r['spread_skill_ratio'], s, r) for s, r in pts.items()), key=lambda t: t[0])
+
+
+def vs_ref_curve(curve, raw):
+    """Uniform-sigma curve linearly interpolated at raw's spread/skill (no extrapolation), and
+    raw minus curve. Spread/skill is in output space, so unlike the mean sigma it doesn't depend on
+    where the gain sits relative to the activations."""
+    ss = raw['spread_skill_ratio']
+    for (s0, g0, r0), (s1, g1, r1) in zip(curve, curve[1:]):
+        if s0 <= ss <= s1:
+            w = (ss - s0) / (s1 - s0) if s1 > s0 else 0.
+            out = {'spread_skill_ratio': ss, 'ref_sigma': g0 + w * (g1 - g0), 'bracket_sigmas': [g0, g1]}
+            for k in ('coverage', 'interval_score_cm', 'crps_cm', 'ensemble_mean_rmse_cm', 'mean_pi_width_cm'):
+                ref = r0[k] + w * (r1[k] - r0[k])
+                out[k] = {'ref': ref, 'adapter': raw[k], 'diff': raw[k] - ref}
+            return out
+    return {'spread_skill_ratio': ss, 'outside_range': [curve[0][0], curve[-1][0]] if curve else None}
 
 
 # ------------------------------------------------------------------ main
@@ -205,7 +322,9 @@ def main():
     to_cm = lambda x: (x.float().clamp(*norm_range) - norm_range[0]) * cm_per_unit  # = Metrics.unnormalize on clamped
     amp_eval = bool(opt['amp']) and dev.type == 'cuda'
 
-    adapter = StemAdapter(net.denoise_fn.downs[0], args.mode, args.init_sigma).to(dev)
+    adapter = StemAdapter(net.denoise_fn.downs[0], args.mode, args.init_sigma,
+                          x_channels=opt['model']['unet']['out_channel'], map_channels=args.map_channels,
+                          max_sigma=args.max_sigma).to(dev)
     n_params = sum(p.numel() for p in adapter.parameters())
     logger.info(f'stem adapter ({args.mode}): {n_params} params on {net.denoise_fn.downs[0].out_channels} channels')
 
@@ -302,8 +421,13 @@ def main():
     val_mask = val_y > args.flood_threshold_cm
     val_eps = torch.randn(args.val_draws, adapter.mu.numel(), generator=torch.Generator().manual_seed(args.seed + 30))
 
+    def reset_stats():
+        if args.mode == 'spatial':
+            adapter.reset_stats()
+
     @torch.no_grad()
     def validate():
+        reset_stats()
         lr, dem = batch_cond(val_batch)
         torch.manual_seed(args.seed + 31)
         draws = []
@@ -316,8 +440,13 @@ def main():
         return ensemble_metrics(torch.stack(draws, 0), val_y[val_mask], args.ci)
 
     # ---------------------------------------------------------- final eval (stem_gain_probe protocol)
+    ref_curve = load_ref_curve(args.ref_sweep)
+    if ref_curve:
+        logger.info('uniform-sigma reference (sigma: ss, raw cov): '
+                    + ', '.join(f"{g:g}: {s:.3f}, {r['coverage']:.3f}" for s, g, r in ref_curve))
     def evaluate(tag):
         t0 = time.time()
+        reset_stats()
         ev_b, ca_b = one_batch(test_set, eval_idx), one_batch(test_set, calib_idx)
         ev_y, ca_y = to_cm(ev_b['HR']), to_cm(ca_b['HR'])
         ev_m, ca_m = ev_y > args.flood_threshold_cm, ca_y > args.flood_threshold_cm
@@ -350,6 +479,21 @@ def main():
         dump()
         logger.info(f'eval [{tag}] ({r["seconds"]:.0f}s); per-draw flooded RMSE {r["per_draw_rmse_cm"]["mean"]:.3f}cm '
                     f'(range {r["per_draw_rmse_cm"]["min"]:.3f}-{r["per_draw_rmse_cm"]["max"]:.3f})')
+        if args.mode == 'spatial':
+            a = r['adapter']
+            logger.info(f"sigma map over eval+calib: mean {a['sigma_mean']:.4f}, "
+                        f"range [{a['sigma_min']:.4f}, {a['sigma_max']:.4f}], within-scene pixel std {a['sigma_pix_std']:.4f}")
+        if ref_curve:
+            c = r['vs_uniform'] = vs_ref_curve(ref_curve, r['raw'])
+            if 'outside_range' in c:
+                logger.info(f"vs uniform sigma: ss {c['spread_skill_ratio']:.3f} outside the sweep's ss range "
+                            f"{c['outside_range']}; add sigmas that bracket it")
+            else:
+                logger.info(f"vs uniform sigma at the same ss {c['spread_skill_ratio']:.3f} (sigma ~{c['ref_sigma']:.4f}, "
+                            f"between {c['bracket_sigmas']}), adapter - uniform: "
+                            + ', '.join(f"{k} {c[k]['adapter']:.3f} - {c[k]['ref']:.3f} = {c[k]['diff']:+.3f}"
+                                        for k in ('coverage', 'interval_score_cm', 'crps_cm', 'ensemble_mean_rmse_cm')))
+            dump()
         logger.info(f"{'method':>9} {'cov':>6} {'width':>7} {'IS':>7} {'CRPS':>6} {'RMSE':>7} {'ss':>6}")
         for name in ('raw', 'cp_cqr', 'cp_scale'):
             m = r[name]
@@ -366,8 +510,8 @@ def main():
         t_tensor = torch.full((x.shape[0],), 10, dtype=torch.long, device=dev)
         cond = [x, lr_lat, dem_lat] if net.dem else [x, lr_lat]
         ref = net.denoise_fn(torch.cat(cond, dim=1), t_tensor)
-        ones = torch.ones(x.shape[0], adapter.mu.numel(), device=dev)
-        diff = (ref - unet_step(x, lr_lat, dem_lat, t_tensor, ones, torch.zeros_like(adapter.beta))).abs().max().item()
+        ident = adapter.identity(x.shape[0], dev)
+        diff = (ref - unet_step(x, lr_lat, dem_lat, t_tensor, ident, torch.zeros_like(adapter.beta))).abs().max().item()
     logger.info(f'identity-adapter check: max |diff| {diff:.2e}')
     if diff > 1e-3:
         raise SystemExit('identity adapter changes the U-Net output; hook is wrong')
@@ -393,6 +537,9 @@ def main():
         for name, px in (('crps', fair_crps(ens, y)), ('is', gauss_is(ens, y, args.ci))):
             loss_fl = px[fl].mean() if fl.any() else px.new_full((), float('nan'))  # all-dry batch
             out[name] = (loss_fl, (loss_fl if fl.any() else 0) + args.dry_weight * px[~fl].mean())
+        # soft coverage on flooded pixels; nan on an all-dry batch (the penalty is skipped there)
+        out['cov'] = gauss_soft_cov(ens, y, args.ci, args.cov_temp)[fl].mean() if fl.any() \
+            else ens.new_full((), float('nan'))
         return out
 
     # ---------------------------------------------------------- gradient diagnostic (no training)
@@ -460,7 +607,8 @@ def main():
     dump()
 
     # ---------------------------------------------------------- train
-    if args.train == 'sigma':
+    if args.train == 'sigma' or args.mode == 'spatial':
+        # spatial mode always keeps mu=1, beta=0: they moved the mean and added noise in v1
         adapter.mu.requires_grad_(False)
         adapter.beta.requires_grad_(False)
     optim = torch.optim.Adam([p for p in adapter.parameters() if p.requires_grad], lr=args.lr)
@@ -472,21 +620,28 @@ def main():
             if step >= args.steps:
                 break
             eps = torch.randn(args.batch_scenes * M, adapter.mu.numel(), generator=train_eps_gen).to(dev)
+            if step % args.log_every == 0:
+                reset_stats()  # sigma-map stats over the steps since the last log
             out = batch_losses(batch, eps, torch.bfloat16)
+            loss = out[args.loss][1]
+            if args.cov_weight and torch.isfinite(out['cov']):
+                loss = loss + args.cov_weight * (args.ci - out['cov']).clamp(min=0)
             optim.zero_grad(set_to_none=True)
-            out[args.loss][1].backward()
+            loss.backward()
             gnorm = torch.nn.utils.clip_grad_norm_(adapter.parameters(), args.grad_clip).item()
             optim.step()
             step += 1
-            losses.append([out['crps'][0].item(), out['is'][0].item()])  # nan on an all-dry batch
+            losses.append([out['crps'][0].item(), out['is'][0].item(), out['cov'].item()])  # nan on an all-dry batch
             if step == 1 or step % args.log_every == 0:
                 s = adapter.summary()
                 recent = np.asarray(losses[-args.log_every:])
                 recent = [float(np.nanmean(c)) if not np.all(np.isnan(c)) else float('nan') for c in recent.T]
                 results['train_log'].append({'step': step, 'flooded_crps_cm': recent[0], 'flooded_is_cm': recent[1],
-                                             'grad_norm': gnorm, **s})
+                                             'flooded_soft_cov': recent[2], 'grad_norm': gnorm, **s})
+                spatial = f' pix std {s["sigma_pix_std"]:.4f}' if args.mode == 'spatial' else ''
                 logger.info(f'step {step}/{args.steps} flooded CRPS {recent[0]:.3f}cm IS {recent[1]:.2f}cm '
-                            f'|g| {gnorm:.2e} sigma {s["sigma_mean"]:.4f} [{s["sigma_min"]:.4f}, {s["sigma_max"]:.4f}] '
+                            f'soft cov {recent[2]:.3f} |g| {gnorm:.2e} '
+                            f'sigma {s["sigma_mean"]:.4f} [{s["sigma_min"]:.4f}, {s["sigma_max"]:.4f}]{spatial} '
                             f'mu {s["mu_mean"]:.4f}+-{s["mu_std"]:.4f} |beta| {s["beta_abs_mean"]:.2e} '
                             f'({time.time() - t0:.0f}s)')
             if step % args.val_every == 0 or step == args.steps:
