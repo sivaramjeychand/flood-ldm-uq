@@ -211,9 +211,15 @@ def main():
     for name, kind, val in methods:
         t0 = time.time()
         adapter = build(kind, val)
-        if adapter is not None and adapter.mode == 'spatial':
-            adapter.reset_stats()
-        E, Cs, Ct = (ensemble(adapter, sets[k]) for k in ('eval', 'calib_src', 'calib_tgt'))
+        spatial = adapter is not None and adapter.mode == 'spatial'
+        ens, sigma_stats = {}, {}
+        for k in ('eval', 'calib_src', 'calib_tgt'):
+            if spatial:
+                adapter.reset_stats()
+            ens[k] = ensemble(adapter, sets[k])
+            if spatial:
+                sigma_stats[k] = adapter.summary()
+        E, Cs, Ct = ens['eval'], ens['calib_src'], ens['calib_tgt']
         ys, yt = sets['calib_src']['y'], sets['calib_tgt']['y']
         r = {'raw': ensemble_metrics(E, ev['y'], args.ci),
              'cqr_src': conformal(Cs, ys, E, ev['y'], args.ci, 'cqr', args.cp_eps_cm),
@@ -222,6 +228,7 @@ def main():
              'scale_tgt': scaled_conformal(Ct, yt, E, ev['y'], args.ci, args.cp_eps_cm),
              'raw_calib_src': ensemble_metrics(Cs, ys, args.ci),
              'adapter': adapter.summary() if adapter is not None else None,
+             'sigma_map': sigma_stats or None,  # spatial: per scene set
              'seconds': time.time() - t0}
         if adapter is not None:
             adapter.handle.remove()
@@ -229,6 +236,9 @@ def main():
         dump()
         logger.info(f'[{name}] {results["methods"][name]} ({r["seconds"]:.0f}s); on Wollombi calib: '
                     f'raw cov {r["raw_calib_src"]["coverage"]:.3f} ss {r["raw_calib_src"]["spread_skill_ratio"]:.3f}')
+        for k, a in sigma_stats.items():
+            logger.info(f'[{name}] sigma map on {k}: mean {a["sigma_mean"]:.4f} range [{a["sigma_min"]:.4f}, '
+                        f'{a["sigma_max"]:.4f}], within-scene pixel std {a["sigma_pix_std"]:.4f}')
 
     # ---------------------------------------------------------- table
     logger.info('=' * 78)

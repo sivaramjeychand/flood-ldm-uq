@@ -18,6 +18,15 @@ conv output (downs[0], 64 channels), trained with a CRPS loss through the full r
                         Mean sigma is not a fair match to a uniform run (the gain's effect scales
                         with the activation it multiplies); compare with --ref_sweep instead.
 
+--freeze_map (spatial): keep the conv at zero, so only the per-channel base log sigma trains. The
+no-map control for a spatial run: same code path, loss, batch, lr and schedule, no input dependence.
+--load PATH: start from a saved stem_adapter.pt (same --mode / --map_channels). With --steps 0 it
+only evaluates.
+--eval_sigma_scales c ...: after the trained eval, re-evaluate with the whole sigma (map) times c
+(tag trained_x<c>). For comparing widths at matched coverage, e.g. against uniform sigma = 0.10.
+Every eval also logs raw_calib (the raw row on the calib scenes, held out from eval) and per-eval-
+scene sums (`per_scene`) for scripts/uq_report.py.
+
 --ref_sweep: raw coverage, IS and CRPS against a uniform-sigma stem_gain_probe sweep interpolated
 at the same spread/skill. Above the curve = the adapter places spread better than uniform sigma.
 The init eval of a stochastic/spatial run is uniform sigma, so it should land on the curve.
@@ -80,7 +89,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from decoder_uq import conformal, ensemble_metrics
-from stem_gain_probe import scaled_conformal
+from stem_gain_probe import per_scene_sums, scaled_conformal
 
 
 def parse_args():
@@ -93,6 +102,11 @@ def parse_args():
     parser.add_argument('--map_channels', type=int, default=1,
                         help='Spatial mode: sigma maps output by the 1x1 conv, 1 (shared by all stem channels) '
                              'or the stem width (one per channel)')
+    parser.add_argument('--freeze_map', action='store_true',
+                        help='Spatial mode: keep the sigma conv at zero (the no-map control)')
+    parser.add_argument('--load', type=str, default=None, help='stem_adapter.pt to start from')
+    parser.add_argument('--eval_sigma_scales', type=float, nargs='+', default=[],
+                        help='Extra evals after training with sigma times each factor')
     parser.add_argument('--max_sigma', type=float, default=0.5, help='Spatial mode: upper clamp on sigma(x, y)')
     parser.add_argument('--ref_sweep', type=str, nargs='+', default=[],
                         help='stem_gain_probe.json files of a uniform-sigma sweep (same eval protocol). Eval reports '
@@ -137,6 +151,10 @@ def parse_args():
         parser.error('--draws must be >= 2: the CRPS spread term needs at least two members')
     if (args.train == 'sigma' or args.grad_probe) and args.mode == 'deterministic':
         parser.error('--train sigma and --grad_probe need --mode stochastic or spatial')
+    if args.freeze_map and args.mode != 'spatial':
+        parser.error('--freeze_map needs --mode spatial')
+    if args.eval_sigma_scales and args.mode == 'deterministic':
+        parser.error('--eval_sigma_scales needs --mode stochastic or spatial')
     return args
 
 
@@ -325,6 +343,12 @@ def main():
     adapter = StemAdapter(net.denoise_fn.downs[0], args.mode, args.init_sigma,
                           x_channels=opt['model']['unet']['out_channel'], map_channels=args.map_channels,
                           max_sigma=args.max_sigma).to(dev)
+    if args.load:
+        ck = torch.load(args.load, map_location=dev)
+        if ck['mode'] != args.mode:
+            raise SystemExit(f"--load: checkpoint mode {ck['mode']} != --mode {args.mode}")
+        adapter.load_state_dict(ck['state_dict'])
+        logger.info(f'loaded adapter from {args.load}')
     n_params = sum(p.numel() for p in adapter.parameters())
     logger.info(f'stem adapter ({args.mode}): {n_params} params on {net.denoise_fn.downs[0].out_channels} channels')
 
@@ -468,8 +492,11 @@ def main():
 
         E, C = ensemble(ev_b, ev_m, args.seed), ensemble(ca_b, ca_m, args.seed + 2)
         y_ev, y_ca = ev_y[ev_m], ca_y[ca_m]
+        ev_sid = torch.arange(ev_m.shape[0]).view(-1, *[1] * (ev_m.dim() - 1)).expand_as(ev_m)[ev_m]
         draw_rmse = torch.sqrt(((E - y_ev) ** 2).mean(1))
         r = {'raw': ensemble_metrics(E, y_ev, args.ci),
+             'raw_calib': ensemble_metrics(C, y_ca, args.ci),
+             'per_scene': per_scene_sums(E, y_ev, ev_sid, args.ci),
              'cp_cqr': conformal(C, y_ca, E, y_ev, args.ci, 'cqr', args.cp_eps_cm),
              'cp_scale': scaled_conformal(C, y_ca, E, y_ev, args.ci, args.cp_eps_cm),
              'per_draw_rmse_cm': {'mean': draw_rmse.mean().item(), 'min': draw_rmse.min().item(),
@@ -611,6 +638,9 @@ def main():
         # spatial mode always keeps mu=1, beta=0: they moved the mean and added noise in v1
         adapter.mu.requires_grad_(False)
         adapter.beta.requires_grad_(False)
+    if args.freeze_map:
+        adapter.sigma_conv.requires_grad_(False)
+    logger.info(f'trained params: {sum(p.numel() for p in adapter.parameters() if p.requires_grad)}')
     optim = torch.optim.Adam([p for p in adapter.parameters() if p.requires_grad], lr=args.lr)
     t0, losses, step = time.time(), [], 0
     train_eps_gen = torch.Generator().manual_seed(args.seed + 40)
@@ -655,6 +685,11 @@ def main():
     save()
     logger.info(f'training done ({time.time() - t0:.0f}s); saved {ckpt_path}')
     evaluate('trained')
+    log_sigma0 = adapter.log_sigma.data.clone()
+    for c in args.eval_sigma_scales:
+        adapter.log_sigma.data.copy_(log_sigma0 + math.log(c))  # sigma(x, y) = c * sigma(x, y), up to max_sigma
+        evaluate(f'trained_x{c:g}')
+    adapter.log_sigma.data.copy_(log_sigma0)
     logger.info('targets (stem_gain_probe v3-uniform-dense, untrained uniform sigma): CRPS 6.592 (sigma=0.055), '
                 'raw IS 57.78 / cov 0.843 (sigma=0.075), cov 0.817 at ss=1 (sigma~0.068); base RMSE 11.911; '
                 'post-hoc reference cp_cqr IS 51.45')

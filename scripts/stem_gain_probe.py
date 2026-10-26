@@ -23,6 +23,11 @@ Rows per sigma
   cp_scale  the ensemble's own interval scaled about its midpoint by one factor fit on calib.
             It keeps the ensemble's per-pixel shape, so it shows whether that shape tracks
             the error better than base does.
+  raw_calib the raw row on the calib scenes. Calib is disjoint from eval, so choosing sigma on
+            raw_calib and reporting it on raw is a held-out choice (scripts/uq_report.py).
+Each sigma also stores `per_scene`: per-eval-scene sums for the raw ensemble (pixels, covered,
+interval score, ensemble variance, squared error of the mean), so uq_report.py can bootstrap
+over scenes, paired with an adapter run on the same eval scenes.
 Gate: training a stem adapter is only worth it if some sigma > 0 beats the sigma=0 cp_cqr
 interval score at matched (calibrated) coverage.
 
@@ -84,6 +89,21 @@ def scaled_conformal(cal_ens, cal_y, ev_ens, ev_y, ci, eps):
     return out
 
 
+def per_scene_sums(ens, y, sid, ci):
+    """Per-scene sums for the raw (K, P) ensemble vs (P,) truth, sid (P,) the scene index of each
+    pixel. Pooling any subset of scenes reproduces ensemble_metrics' coverage, IS and spread/skill."""
+    alpha = 1 - ci
+    lo, hi = torch.quantile(ens, alpha / 2, dim=0), torch.quantile(ens, 1 - alpha / 2, dim=0)
+    score = (hi - lo) + (2 / alpha) * ((lo - y).clamp(min=0) + (y - hi).clamp(min=0))
+    n = int(sid.max()) + 1 if sid.numel() else 0
+    sums = lambda v: torch.bincount(sid, weights=v.double(), minlength=n).tolist()
+    return {'n_pixels': torch.bincount(sid, minlength=n).tolist(),
+            'covered': sums(((y >= lo) & (y <= hi)).float()),
+            'interval_score_cm': sums(score),
+            'ens_var': sums(ens.var(0, unbiased=ens.shape[0] > 1)),
+            'sq_err': sums((ens.mean(0) - y) ** 2)}
+
+
 def main():
     import core.logger as Logger
     import core.metrics as Metrics
@@ -126,6 +146,7 @@ def main():
     ev_hr, ca_hr = to_depth(ev_batch['HR']), to_depth(ca_batch['HR'])
     ev_mask, ca_mask = ev_hr > args.flood_threshold_cm, ca_hr > args.flood_threshold_cm
     y_ev, y_ca = ev_hr[ev_mask], ca_hr[ca_mask]
+    ev_sid = torch.arange(ev_mask.shape[0]).view(-1, *[1] * (ev_mask.dim() - 1)).expand_as(ev_mask)[ev_mask]
 
     stem = runner.net.denoise_fn.downs[0]
     w0 = stem.weight.data.clone()
@@ -178,6 +199,8 @@ def main():
         C = ensemble(ca_batch, ca_mask, sigma, args.seed + 2)  # independent noise from eval, as decoder_uq
         draw_rmse = torch.sqrt(((E - y_ev) ** 2).mean(1))
         r = {'raw': ensemble_metrics(E, y_ev, ci),
+             'raw_calib': ensemble_metrics(C, y_ca, ci),
+             'per_scene': per_scene_sums(E, y_ev, ev_sid, ci),
              'cp_cqr': conformal(C, y_ca, E, y_ev, ci, 'cqr', args.cp_eps_cm),
              'cp_scale': scaled_conformal(C, y_ca, E, y_ev, ci, args.cp_eps_cm),
              'per_draw_rmse_cm': {'mean': draw_rmse.mean().item(), 'min': draw_rmse.min().item(),
