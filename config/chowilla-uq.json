@@ -1,0 +1,106 @@
+{
+    "name": "chowilla-uq",
+    // In-domain UQ on Chowilla: its own released LDM checkpoint, test + train splits of its own catchment.
+    // Same meta / VAEs / backward_start as wollombi-trnf.json so the adapter protocol carries over unchanged.
+    "phase": "train",
+    "distributed": false,
+    "amp": true,
+    "latent": true,
+    "dem": true,
+    "path": {
+        "log": "logs",
+        "tb_logger": "tb_logger",
+        "results": "results",
+        "checkpoint": "checkpoint",
+        "resume_state": "../checkpoints/chowilla/I300000_E480", // released checkpoint (README Drive link); name from upstream chowilla-trnf.json, check after download
+        "vae_state": "../checkpoints/vae/vae.pth",
+        "vae_dem_state": "../checkpoints/vae/vae_dem.pth"
+    },
+    "datasets": {
+        "meta": {
+            "max_depth": 3200,
+            "dem_max_value": 440,
+            "dem_min_value": -20,
+            "norm_min": -1,
+            "norm_max": 1,
+            "channels": 1,
+            "image_size": 512
+        },
+        "train": {
+            "catchment": "Chowilla Latent",
+            "dataroot": "../data/chowilla_latent", // unused by the UQ scripts (pixel dataset, phase test)
+            "batch_size": 256,
+            "num_workers": 1,
+            "use_shuffle": true,
+            "data_len": -1
+        },
+        "test": {
+            "catchment": "Chowilla",
+            "dataroot": "../data/chowilla", // needs train_hr/ + train_lr/ for train_stem_adapter.py
+            "batch_size": 40,
+            "use_shuffle": false,
+            "data_len": -1,
+            "epochs": 1
+        }
+    },
+    "model": {
+        "which_model_G": "ddpm",
+        "finetune_norm": false,
+        "unet": {
+            "in_channel": 12,
+            "out_channel": 4,
+            "inner_channel": 64,
+            "norm_groups": 16,
+            "channel_multiplier": [
+                1,
+                2,
+                4,
+                8,
+                16
+            ],
+            "attn_res": [
+                16
+            ],
+            "res_blocks": 1,
+            "dropout": 0
+        },
+        "beta_schedule": {
+            "train": {
+                "schedule": "linear",
+                "n_timestep": 1000,
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            },
+            "test": {
+                "schedule": "linear",
+                "n_timestep": 1000,
+                "backward_start": 50,
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            }
+        },
+        "diffusion": {
+            "image_size": 64,
+            "loss_type": "l2",
+            "conditional": true 
+        }
+    },
+    "train": {
+        "n_iter": 300000,
+        "val_freq": 2e4,
+        "save_checkpoint_freq": 2e4,
+        "print_freq": 500,
+        "optimizer": {
+            "type": "adam",
+            "lr": 1e-6,
+            "lr_scheduler": {
+                "schedule": "linear_warmup",
+                "until": 10000
+            }
+        }
+    },
+    "test": {
+        "save_results": false,
+        "thresholds": []
+    }
+}

@@ -28,6 +28,9 @@ Rows per sigma
 Each sigma also stores `per_scene`: per-eval-scene sums for the raw ensemble (pixels, covered,
 interval score, ensemble variance, squared error of the mean), so uq_report.py can bootstrap
 over scenes, paired with an adapter run on the same eval scenes.
+--k_curve K ...: the raw eval row recomputed on random K-member subsets of the draws (mean of --k_reps),
+with the ensemble-mean RMSE next to the oracle per-scene best member and the mean single-member RMSE
+(`k_curve`, also used by train_stem_adapter.py). No extra sampling; at K = 1 the interval is a point.
 Gate: training a stem adapter is only worth it if some sigma > 0 beats the sigma=0 cp_cqr
 interval score at matched (calibrated) coverage.
 
@@ -66,6 +69,9 @@ def parse_args():
     parser.add_argument('--ci', type=float, default=0.90)
     parser.add_argument('--flood_threshold_cm', type=float, default=5.0)
     parser.add_argument('--cp_eps_cm', type=float, default=0.5, help='Floor on the half-width in the cp_scale score')
+    parser.add_argument('--k_curve', type=int, nargs='*', default=[],
+                        help='Ensemble sizes for the raw-metrics-vs-K curve on eval (subsets of the --n_samples draws)')
+    parser.add_argument('--k_reps', type=int, default=10, help='Random subsets per K in the K curve')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('-debug', '-d', action='store_true')
     args = parser.parse_args()
@@ -102,6 +108,40 @@ def per_scene_sums(ens, y, sid, ci):
             'interval_score_cm': sums(score),
             'ens_var': sums(ens.var(0, unbiased=ens.shape[0] > 1)),
             'sq_err': sums((ens.mean(0) - y) ** 2)}
+
+
+def k_curve(ens, y, sid, ci, ks, reps, seed):
+    """Raw metrics against ensemble size. For each k, the mean over `reps` random k-member subsets of
+    the (K, P) ensemble (one subset when k = K, which reproduces the full row). Each row also has
+    best_member_rmse_cm, the oracle best member: per scene, the member with the lowest flooded MSE,
+    chosen with the truth, so it shows how close the ensemble gets, not a usable prediction. And
+    member_rmse_cm, the mean single-member RMSE. Both are pooled over pixels like ensemble_mean_rmse_cm."""
+    K, P = ens.shape
+    sid = sid.to(ens.device)
+    sq = torch.stack([torch.bincount(sid, weights=((e - y) ** 2).double(), minlength=int(sid.max()) + 1)
+                      for e in ens]).cpu()  # (K, scenes) squared-error sums
+    gen = torch.Generator().manual_seed(seed)
+    out = {}
+    for k in sorted({min(k, K) for k in ks}):
+        rows = []
+        for _ in range(1 if k == K else reps):
+            idx = torch.randperm(K, generator=gen)[:k]
+            m = ensemble_metrics(ens[idx.to(ens.device)], y, ci)
+            m['best_member_rmse_cm'] = (sq[idx].min(0).values.sum() / P).sqrt().item()
+            m['member_rmse_cm'] = (sq[idx].sum(1) / P).sqrt().mean().item()
+            rows.append(m)
+        out[str(k)] = {key: float(np.mean([r[key] for r in rows])) for key in rows[0]}
+        out[str(k)]['reps'] = len(rows)
+    return out
+
+
+def log_k_curve(logger, kc):
+    logger.info(f"{'K':>4} {'cov':>6} {'width':>7} {'IS':>7} {'CRPS':>6} {'ss':>6} "
+                f"{'ensmean':>8} {'best':>7} {'member':>7}  (RMSE cm; best = oracle per-scene best member)")
+    for k, m in kc.items():
+        logger.info(f"{k:>4} {m['coverage']:6.3f} {m['mean_pi_width_cm']:7.3f} {m['interval_score_cm']:7.3f} "
+                    f"{m['crps_cm']:6.3f} {m['spread_skill_ratio']:6.3f} {m['ensemble_mean_rmse_cm']:8.3f} "
+                    f"{m['best_member_rmse_cm']:7.3f} {m['member_rmse_cm']:7.3f}")
 
 
 def main():
@@ -206,6 +246,8 @@ def main():
              'per_draw_rmse_cm': {'mean': draw_rmse.mean().item(), 'min': draw_rmse.min().item(),
                                   'max': draw_rmse.max().item()},
              'seconds': time.time() - t0}
+        if args.k_curve:
+            r['k_curve'] = k_curve(E, y_ev, ev_sid, ci, args.k_curve, args.k_reps, args.seed + 4)
         rows[str(sigma)] = r
         dump()
         del E, C
@@ -219,6 +261,8 @@ def main():
             ss = f"{m['spread_skill_ratio']:6.3f}" if 'spread_skill_ratio' in m else f"{'-':>6}"
             logger.info(f"{sigma:6g} {name:>9} {m['coverage']:6.3f} {m['mean_pi_width_cm']:7.3f} "
                         f"{m['interval_score_cm']:7.3f} {crps} {m['ensemble_mean_rmse_cm']:7.3f} {ss}")
+        if 'k_curve' in r:
+            log_k_curve(logger, r['k_curve'])
 
     # Gate: best calibrated interval score at sigma > 0 vs CQR on the base ensemble
     logger.info('=' * 78)

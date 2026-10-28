@@ -89,7 +89,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from decoder_uq import conformal, ensemble_metrics
-from stem_gain_probe import per_scene_sums, scaled_conformal
+from stem_gain_probe import k_curve, log_k_curve, per_scene_sums, scaled_conformal
 
 
 def parse_args():
@@ -143,6 +143,9 @@ def parse_args():
     parser.add_argument('--ci', type=float, default=0.90)
     parser.add_argument('--flood_threshold_cm', type=float, default=5.0)
     parser.add_argument('--cp_eps_cm', type=float, default=0.5)
+    parser.add_argument('--k_curve', type=int, nargs='*', default=[],
+                        help='Ensemble sizes for the raw-metrics-vs-K curve on eval (stem_gain_probe.k_curve)')
+    parser.add_argument('--k_reps', type=int, default=10)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('-debug', '-d', action='store_true')
     args = parser.parse_args()
@@ -502,6 +505,8 @@ def main():
              'per_draw_rmse_cm': {'mean': draw_rmse.mean().item(), 'min': draw_rmse.min().item(),
                                   'max': draw_rmse.max().item()},
              'adapter': adapter.summary(), 'seconds': time.time() - t0}
+        if args.k_curve:
+            r['k_curve'] = k_curve(E, y_ev, ev_sid, args.ci, args.k_curve, args.k_reps, args.seed + 4)
         results['eval'][tag] = r
         dump()
         logger.info(f'eval [{tag}] ({r["seconds"]:.0f}s); per-draw flooded RMSE {r["per_draw_rmse_cm"]["mean"]:.3f}cm '
@@ -528,6 +533,8 @@ def main():
             ss = f"{m['spread_skill_ratio']:6.3f}" if 'spread_skill_ratio' in m else f"{'-':>6}"
             logger.info(f"{name:>9} {m['coverage']:6.3f} {m['mean_pi_width_cm']:7.3f} "
                         f"{m['interval_score_cm']:7.3f} {crps} {m['ensemble_mean_rmse_cm']:7.3f} {ss}")
+        if 'k_curve' in r:
+            log_k_curve(logger, r['k_curve'])
 
     # Identity check: with gamma=1, beta=0 the hook must not change the U-Net output
     with torch.no_grad(), torch.autocast('cuda', enabled=amp_eval):
