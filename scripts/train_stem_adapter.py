@@ -51,7 +51,8 @@ Gradients run through every reverse step (per-step gradient
 checkpointing on the U-Net) and through the frozen VAE decoder. The U-Net, both VAEs and
 the encoder noise get no gradients; only the adapter trains.
 
-Eval: the stem_gain_probe protocol (same eval/calib scenes, seeds, gain draws, scoring), on
+Eval: the stem_gain_probe protocol (same eval/calib scenes, seeds, gain draws, scoring; --screen
+picks scenes as stem_gain_probe --screen does, so pass it to both or neither), on
 the raw ensemble and with cp_cqr / cp_scale as post-hoc references. Targets from
 stem_gain_probe v1/v2-wide (FloodLDM_Codebase_Context.md §11): beat CRPS 6.604cm and raw
 IS 57.96cm, reach ~0.9 raw coverage at spread/skill near 1, ensemble-mean RMSE close to 11.91cm.
@@ -89,7 +90,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from decoder_uq import conformal, ensemble_metrics
-from stem_gain_probe import k_curve, log_k_curve, per_scene_sums, scaled_conformal
+from stem_gain_probe import k_curve, log_k_curve, per_scene_sums, scaled_conformal, screen_scenes
 
 
 def parse_args():
@@ -146,6 +147,11 @@ def parse_args():
     parser.add_argument('--k_curve', type=int, nargs='*', default=[],
                         help='Ensemble sizes for the raw-metrics-vs-K curve on eval (stem_gain_probe.k_curve)')
     parser.add_argument('--k_reps', type=int, default=10)
+    parser.add_argument('--screen', action='store_true',
+                        help='Pick eval / calib / val with stem_gain_probe.screen_scenes instead of first-N-files '
+                             '(must match the --ref_sweep runs)')
+    parser.add_argument('--min_flooded_frac', type=float, default=0.01, help='--screen: flooded-fraction floor')
+    parser.add_argument('--max_screen', type=int, default=20000, help='--screen: scenes to screen at most')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('-debug', '-d', action='store_true')
     args = parser.parse_args()
@@ -282,13 +288,17 @@ def gauss_soft_cov(ens, y, ci, temp):
     return torch.sigmoid((y - m + z * s) / temp) * torch.sigmoid((m + z * s - y) / temp)
 
 
-def load_ref_curve(paths):
-    """Raw-ensemble rows of uniform-sigma stem_gain_probe sweeps, merged and sorted by spread/skill."""
+def load_ref_curve(paths, eval_files):
+    """Raw-ensemble rows of uniform-sigma stem_gain_probe sweeps, merged and sorted by spread/skill.
+    Each sweep must have been run on exactly these eval scenes (same --screen / --seed / --n_eval)."""
     pts = {}
     for p in paths:
         with open(p) as f:
-            for s, r in json.load(f)['sweep'].items():
-                pts[float(s)] = r['raw']
+            ref = json.load(f)
+        if 'eval_files' in ref and sorted(ref['eval_files']) != sorted(eval_files):
+            raise SystemExit(f'--ref_sweep {p} was run on different eval scenes; match --screen / --seed / --n_eval')
+        for s, r in ref['sweep'].items():
+            pts[float(s)] = r['raw']
     return sorted(((r['spread_skill_ratio'], s, r) for s, r in pts.items()), key=lambda t: t[0])
 
 
@@ -405,14 +415,24 @@ def main():
     test_set = Data.create_dataset(base_opt, 'test', meta, latent=False, dem=opt['dem'])
     train_set = Data.create_dataset(base_opt, 'train', meta, latent=False, dem=opt['dem'])
     # eval / calib exactly as decoder_uq.py and stem_gain_probe.py
-    rng = np.random.default_rng(args.seed)
-    eval_idx = list(range(min(args.n_eval, len(test_set))))
-    rest = np.arange(len(eval_idx), len(test_set))
-    calib_idx = sorted(rng.choice(rest, size=min(args.n_calib, len(rest)), replace=False).tolist())
-    # validation: other test scenes, disjoint from both; training: random train-split scenes
     rng2 = np.random.default_rng(args.seed + 10)
-    val_pool = np.setdiff1d(rest, calib_idx)
-    val_idx = sorted(rng2.choice(val_pool, size=min(args.n_val, len(val_pool)), replace=False).tolist())
+    if args.screen:
+        # eval / calib = stem_gain_probe --screen's (the first n_eval + n_calib screened scenes); val = the
+        # next n_val screened scenes, so it is disjoint from both and not dry either
+        picked = screen_scenes(test_set, meta, args.n_eval + args.n_calib + args.n_val, args.seed,
+                               args.flood_threshold_cm, args.min_flooded_frac, args.max_screen, logger)
+        eval_idx = picked[:args.n_eval]
+        calib_idx = picked[args.n_eval:args.n_eval + args.n_calib]
+        val_idx = sorted(picked[args.n_eval + args.n_calib:])
+    else:
+        rng = np.random.default_rng(args.seed)
+        eval_idx = list(range(min(args.n_eval, len(test_set))))
+        rest = np.arange(len(eval_idx), len(test_set))
+        calib_idx = sorted(rng.choice(rest, size=min(args.n_calib, len(rest)), replace=False).tolist())
+        # validation: other test scenes, disjoint from both
+        val_pool = np.setdiff1d(rest, calib_idx)
+        val_idx = sorted(rng2.choice(val_pool, size=min(args.n_val, len(val_pool)), replace=False).tolist())
+    # training: random train-split scenes
     train_idx = sorted(rng2.choice(len(train_set), size=min(args.n_train, len(train_set)), replace=False).tolist())
 
     def one_batch(ds, idx):
@@ -467,7 +487,7 @@ def main():
         return ensemble_metrics(torch.stack(draws, 0), val_y[val_mask], args.ci)
 
     # ---------------------------------------------------------- final eval (stem_gain_probe protocol)
-    ref_curve = load_ref_curve(args.ref_sweep)
+    ref_curve = load_ref_curve(args.ref_sweep, [test_set.filenames[i] for i in eval_idx])
     if ref_curve:
         logger.info('uniform-sigma reference (sigma: ss, raw cov): '
                     + ', '.join(f"{g:g}: {s:.3f}, {r['coverage']:.3f}" for s, g, r in ref_curve))

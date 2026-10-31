@@ -47,7 +47,7 @@ import numpy as np
 import torch
 
 from decoder_uq import conformal, ensemble_metrics
-from stem_gain_probe import scaled_conformal
+from stem_gain_probe import scaled_conformal, screen_scenes
 
 
 def parse_args():
@@ -93,7 +93,6 @@ def read_config(path):
 def main():
     import core.logger as Logger
     import data as Data
-    import data.util as Util
     import model as Model
     from collapse_ablation import Runner
     from train_stem_adapter import StemAdapter
@@ -125,23 +124,8 @@ def main():
 
     # ---------------------------------------------------------- scenes
     tgt_set = Data.create_dataset(dict(opt['datasets']['test'], data_len=-1), 'test', meta, latent=False, dem=opt['dem'])
-    order = sorted(range(len(tgt_set)), key=lambda i: tgt_set.filenames[i])
-    order = [order[i] for i in np.random.default_rng(args.seed).permutation(len(order))]
-    need, picked, frac_all, t0 = args.n_eval + args.n_calib, [], [], time.time()
-    for i in order[:args.max_screen]:
-        hr = Util.load_tiff(os.path.join(tgt_set.high_res_folder, tgt_set.filenames[i]), meta['max_depth'], norm=norm_range)
-        f = (to_cm(hr) > args.flood_threshold_cm).float().mean().item()
-        frac_all.append(f)
-        if f >= args.min_flooded_frac:
-            picked.append(i)
-            if len(picked) == need:
-                break
-    logger.info(f'target screening: {len(frac_all)} scenes read ({time.time() - t0:.0f}s), '
-                f'{np.mean(np.asarray(frac_all) >= args.min_flooded_frac):.1%} pass flooded fraction >= '
-                f'{args.min_flooded_frac}; mean flooded fraction of all screened {np.mean(frac_all):.2%}')
-    if len(picked) < need:
-        raise SystemExit(f'only {len(picked)} target scenes pass the flood screen, need {need}; '
-                         'lower --min_flooded_frac or raise --max_screen')
+    picked = screen_scenes(tgt_set, meta, args.n_eval + args.n_calib, args.seed, args.flood_threshold_cm,
+                           args.min_flooded_frac, args.max_screen, logger)
     ev_idx, ca_idx = picked[:args.n_eval], picked[args.n_eval:]
 
     # source calib: decoder_uq / stem_gain_probe protocol on the source test set

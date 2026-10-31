@@ -12,7 +12,9 @@ across noise seeds. Here the gain differs between draws, so between-member varia
 of the ensemble.
 
 Scenes, seeds and scoring match decoder_uq.py: eval = the first --n_eval test scenes, calib =
-the same random --n_calib test scenes, flooded pixels only. At sigma=0 the ensemble is
+the same random --n_calib test scenes, flooded pixels only. --screen instead takes both from
+screen_scenes (zeroshot_uq.py's flood-screened, listdir-independent protocol, same seed => the
+same eval scenes as zeroshot_uq on that catchment); use it on Burnett / Chowilla. At sigma=0 the ensemble is
 decoder_uq's `base`, so its cp_cqr row reproduces the bar to beat (IS 51.454cm in v1).
 The eps_m are fixed across sigma and every sigma replays the same noise stream (the number
 of random draws doesn't depend on the weights), so the curve differs only through sigma.
@@ -72,6 +74,10 @@ def parse_args():
     parser.add_argument('--k_curve', type=int, nargs='*', default=[],
                         help='Ensemble sizes for the raw-metrics-vs-K curve on eval (subsets of the --n_samples draws)')
     parser.add_argument('--k_reps', type=int, default=10, help='Random subsets per K in the K curve')
+    parser.add_argument('--screen', action='store_true',
+                        help='Pick eval / calib with screen_scenes (zeroshot_uq.py protocol) instead of first-N-files')
+    parser.add_argument('--min_flooded_frac', type=float, default=0.01, help='--screen: flooded-fraction floor')
+    parser.add_argument('--max_screen', type=int, default=20000, help='--screen: scenes to screen at most')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('-debug', '-d', action='store_true')
     args = parser.parse_args()
@@ -93,6 +99,34 @@ def scaled_conformal(cal_ens, cal_y, ev_ens, ev_y, ci, eps):
     out = interval_metrics((em - q * eh).clamp(min=0), em + q * eh, ev_y, ci)
     out.update({'q': q, 'ensemble_mean_rmse_cm': torch.sqrt(((ev_ens.mean(0) - ev_y) ** 2).mean()).item()})
     return out
+
+
+def screen_scenes(ds, meta, n, seed, flood_threshold_cm, min_flooded_frac, max_screen, logger):
+    """zeroshot_uq.py's scene protocol: sorted filenames, seeded shuffle, keep the first n scenes whose
+    flooded fraction (HR > flood_threshold_cm) is >= min_flooded_frac. Unlike first-N-files it doesn't
+    depend on os.listdir order, and it can't pick an all-dry stretch."""
+    import data.util as Util
+    norm_range = (meta['norm_min'], meta['norm_max'])
+    cm_per_unit = meta['max_depth'] / (norm_range[1] - norm_range[0])
+    order = sorted(range(len(ds)), key=lambda i: ds.filenames[i])
+    order = [order[i] for i in np.random.default_rng(seed).permutation(len(order))]
+    picked, frac_all, t0 = [], [], time.time()
+    for i in order[:max_screen]:
+        hr = Util.load_tiff(os.path.join(ds.high_res_folder, ds.filenames[i]), meta['max_depth'], norm=norm_range)
+        cm = (hr.float().clamp(*norm_range) - norm_range[0]) * cm_per_unit
+        f = (cm > flood_threshold_cm).float().mean().item()
+        frac_all.append(f)
+        if f >= min_flooded_frac:
+            picked.append(i)
+            if len(picked) == n:
+                break
+    logger.info(f'scene screening: {len(frac_all)} scenes read ({time.time() - t0:.0f}s), '
+                f'{np.mean(np.asarray(frac_all) >= min_flooded_frac):.1%} pass flooded fraction >= '
+                f'{min_flooded_frac}; mean flooded fraction of all screened {np.mean(frac_all):.2%}')
+    if len(picked) < n:
+        raise SystemExit(f'only {len(picked)} scenes pass the flood screen, need {n}; '
+                         'lower --min_flooded_frac or raise --max_screen')
+    return picked
 
 
 def per_scene_sums(ens, y, sid, ci):
@@ -173,10 +207,15 @@ def main():
     # Same eval / calib scenes as decoder_uq.py (same rng, same draw order)
     base_opt = dict(opt['datasets']['test'], data_len=-1, use_shuffle=False)
     test_set = Data.create_dataset(base_opt, 'test', meta, latent=False, dem=opt['dem'])
-    rng = np.random.default_rng(args.seed)
-    eval_idx = list(range(min(args.n_eval, len(test_set))))
-    rest = np.arange(len(eval_idx), len(test_set))
-    calib_idx = sorted(rng.choice(rest, size=min(args.n_calib, len(rest)), replace=False).tolist())
+    if args.screen:
+        picked = screen_scenes(test_set, meta, args.n_eval + args.n_calib, args.seed, args.flood_threshold_cm,
+                               args.min_flooded_frac, args.max_screen, logger)
+        eval_idx, calib_idx = picked[:args.n_eval], picked[args.n_eval:]
+    else:
+        rng = np.random.default_rng(args.seed)
+        eval_idx = list(range(min(args.n_eval, len(test_set))))
+        rest = np.arange(len(eval_idx), len(test_set))
+        calib_idx = sorted(rng.choice(rest, size=min(args.n_calib, len(rest)), replace=False).tolist())
 
     def one_batch(idx):
         return next(iter(torch.utils.data.DataLoader(torch.utils.data.Subset(test_set, idx), batch_size=len(idx),
